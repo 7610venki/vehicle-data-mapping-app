@@ -356,9 +356,19 @@ export class MappingService {
                 if(onProgressUpdate) onProgressUpdate(rec, recordsProcessedCount + batch.indexOf(rec), totalRecords);
             });
 
+            // Create a tailored, relevant IC list for this specific batch to give the AI better context.
+            const uniqueMakesInBatch = [...new Set(batch.map(r => r.__shoryMake).filter((m): m is string => !!m))];
+            const relevantIcRecords = processedIcRecords.filter(icRec => 
+              uniqueMakesInBatch.includes(icRec.__icMake!)
+            );
+            
+            // If filtering results in an empty list (e.g., all makes in batch are new), 
+            // fall back to the full list to give the AI a chance. Otherwise, use the filtered list.
+            const icListForPrompt = relevantIcRecords.length > 0 ? relevantIcRecords : processedIcRecords;
+
             const batchResults = await this.llmProvider.findBestMatchBatch(
                 batch.map(r => ({ id: r.__id, make: r[shoryConfig.make] as string, model: r[shoryConfig.model] as string })), // Send original make/model to AI
-                processedIcRecords.map(r => ({ make: r[icConfig.make] as string, model: r[icConfig.model] as string, code: (icConfig.codes?.[0] && r.__icCodes) ? r.__icCodes[icConfig.codes[0]] : undefined}))
+                icListForPrompt.map(r => ({ make: r[icConfig.make] as string, model: r[icConfig.model] as string, code: (icConfig.codes?.[0] && r.__icCodes) ? r.__icCodes[icConfig.codes[0]] : undefined}))
             );
 
             for (const [shoryId, result] of batchResults.entries()) {
