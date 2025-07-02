@@ -13,6 +13,39 @@ It's designed to solve common data inconsistencies, like:
 
 The app uses multiple layers of technology, including fuzzy text matching and advanced AI, to find the most accurate match for each of your records. Best of all, it learns from every session run by all users, constantly improving its accuracy for everyone.
 
+## How It Works: The Four-Layer Matching Engine
+
+This app doesn't just use one method to find matches; it uses a sophisticated, four-layer engine. When you start the mapping process, each of your Shory records is processed through these layers sequentially until a high-confidence match is found. This layered approach maximizes both speed and accuracy.
+
+#### Layer 1: Cloud Knowledge Base (Fastest)
+
+*   **What it is:** A global, shared database of high-confidence historical matches.
+*   **How it works:** Before any complex processing, the system checks if an identical mapping (e.g., `"Chevy"` to `"Chevrolet"`) has been successfully made by any user before. If so, it's an instant match.
+*   **Benefit:** This is the fastest and most accurate layer, resolving common matches in milliseconds. It gets smarter and faster as more people use the app.
+
+#### Layer 2: AI-Generated Rules (Fast)
+
+*   **What it is:** A set of general matching rules that the AI has automatically created by observing patterns in past matches.
+*   **How it works:** It applies rules like, "If `make` is `mercedes` and `model` contains `benz`, set `make` to `Mercedes-Benz`."
+*   **Benefit:** Catches common variations that aren't yet in the knowledge base, providing another layer of high-speed matching.
+
+#### Layer 3: Fuzzy Matching (For Typos)
+
+*   **What it is:** A text-similarity algorithm (Fuse.js) designed to find matches with minor typos or spelling differences.
+*   **How it works:** If no knowledge or rule applies, the app calculates a "fuzzy" similarity score between your record and potential matches (e.g., it will find that "Hundai" is very similar to "Hyundai"). You can control the strictness of this matching in the Parameters step.
+*   **Benefit:** Reliably handles common human errors in data entry.
+
+#### Layer 4: Advanced AI Matching (Most Powerful)
+
+For the most difficult cases that remain, the app uses the Google Gemini AI model in two powerful ways:
+
+1.  **Semantic Comparison:** For records where fuzzy matching finds several *possible* candidates, it sends the top few to the AI. The AI then uses its deep understanding of language and context to choose the single best semantic fit.
+2.  **Web Search Grounding:** For records with no obvious candidates at all, it uses **Gemini with Google Search**. The AI can search the web for real-world information about the vehicle (e.g., rare models, new releases, or regional naming conventions) to make an informed decision. The sources it uses are even provided in the results for transparency.
+
+### The Learning Loop
+
+The most powerful feature is that the system learns. High-confidence matches made by the Fuzzy and AI layers are used to anonymously update the global **Knowledge Base** and generate new **Rules**. This creates a powerful feedback loop where the application becomes faster, more accurate, and more intelligent with every session run by every user.
+
 ## How to Use It: A Quick Guide
 
 Follow these simple steps to map your data:

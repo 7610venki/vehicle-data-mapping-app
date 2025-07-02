@@ -1,5 +1,4 @@
 
-
 import { SupabaseClient } from "@supabase/supabase-js";
 import { 
     LlmProvider, 
@@ -8,10 +7,53 @@ import {
     SemanticBatchTask, 
     SemanticLLMBatchResult, 
     WebSearchBatchResult,
-    GroundingSource 
+    GroundingSource,
+    GenerateContentResponse,
 } from "../../types";
 import { GEMINI_MODEL_TEXT } from '../../constants';
 import { supabaseUrl } from "../supabaseClient";
+
+// Helper to process the stream from the proxy which sends ndjson (newline-delimited JSON)
+class NdjsonParser implements TransformStream<Uint8Array, any> {
+    readable: ReadableStream<any>;
+    writable: WritableStream<Uint8Array>;
+
+    constructor() {
+        let buffer = '';
+        const decoder = new TextDecoder();
+        
+        const transformStream = new TransformStream({
+            transform(chunk, controller) {
+                buffer += decoder.decode(chunk, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop() ?? ''; // Keep the last, possibly incomplete, line
+
+                for (const line of lines) {
+                    if (line.trim() === '') continue;
+                    try {
+                        controller.enqueue(JSON.parse(line));
+                    } catch (e) {
+                        console.error("Failed to parse JSON line from stream:", line, e);
+                    }
+                }
+            },
+            flush(controller) {
+                // If there's anything left in the buffer when the stream is closing,
+                // try to parse it.
+                if (buffer.trim()) {
+                    try {
+                        controller.enqueue(JSON.parse(buffer));
+                    } catch (e) {
+                        console.error("Failed to parse final JSON chunk from stream:", buffer, e);
+                    }
+                }
+            }
+        });
+
+        this.readable = transformStream.readable;
+        this.writable = transformStream.writable;
+    }
+}
 
 
 export class GeminiProvider implements LlmProvider {
@@ -19,260 +61,137 @@ export class GeminiProvider implements LlmProvider {
   private model = GEMINI_MODEL_TEXT;
 
   constructor(supabase: SupabaseClient) {
-    if (!supabase) {
-      throw new Error("GeminiProvider requires a Supabase client instance for secure proxy calls.");
-    }
+    if (!supabase) throw new Error("GeminiProvider requires a Supabase client instance for secure proxy calls.");
     this.supabase = supabase;
   }
   
-  private parseJsonArrayResponse(text: string): any[] | null {
-    let originalText = text.trim();
-    let textToParse = originalText;
-
-    const fenceRegex = /```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/;
-    const fenceMatch = originalText.match(fenceRegex);
-
-    if (fenceMatch && fenceMatch[1]) {
-        textToParse = fenceMatch[1].trim();
-    }
-    
-    try {
-        const parsed = JSON.parse(textToParse);
-        if (Array.isArray(parsed)) return parsed;
-
-        if (typeof parsed === 'object' && parsed !== null) {
-            const key = Object.keys(parsed).find(k => Array.isArray(parsed[k]));
-            if(key) return parsed[key];
-        }
-
-    } catch (e) {
-        console.warn("Primary JSON array parse failed, attempting recovery...", e);
-        const recoveredObjects: any[] = [];
-        const objectMatches = textToParse.match(/\{[\s\S]*?\}/g);
-        
-        if (objectMatches) {
-            objectMatches.forEach(objStr => {
-                try {
-                    const parsedObj = JSON.parse(objStr);
-                    recoveredObjects.push(parsedObj);
-                } catch (recoveryError) {
-                    console.warn("Could not recover a JSON object from string:", objStr);
-                }
-            });
-        }
-        
-        if (recoveredObjects.length > 0) {
-            console.log(`Successfully recovered ${recoveredObjects.length} objects from a malformed array.`);
-            return recoveredObjects;
-        }
-    }
-    
-    console.error("Failed to parse JSON array response. Original text:", originalText);
-    return null;
-  }
-
-  private async _makeApiCall(
-    prompt: string,
-    tools?: any,
-    responseMimeType: string = "application/json"
-  ): Promise<any> {
-    if (!supabaseUrl) {
-      throw new Error("Supabase URL is not configured. Cannot contact the proxy Edge Function.");
-    }
+  private async *_makeApiCallStream(prompt: string, tools?: any): AsyncGenerator<GenerateContentResponse, void, undefined> {
+    if (!supabaseUrl) throw new Error("Supabase URL is not configured.");
     const proxyEndpoint = `${supabaseUrl}/functions/v1/proxy-llm`;
-
     const { data: { session } } = await this.supabase.auth.getSession();
-    if (!session) {
-      throw new Error("User is not authenticated. Cannot call the secure proxy.");
-    }
+    if (!session) throw new Error("User not authenticated.");
 
-    const body: any = {
-      provider: 'gemini',
-      model: this.model,
-      prompt: prompt,
-      responseMimeType: responseMimeType
-    };
-    if (tools) {
-      body.tools = tools;
-    }
-
+    const body: any = { provider: 'gemini', model: this.model, prompt, stream: true };
+    if (tools) body.tools = tools;
+    
     const response = await fetch(proxyEndpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${session.access_token}`,
-      },
-      body: JSON.stringify(body),
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${session.access_token}` },
+        body: JSON.stringify(body),
     });
 
-    const responseText = await response.text();
-    if (!response.ok) {
-      throw new Error(`Proxy API call for Gemini failed with status ${response.status}: ${responseText}`);
+    if (!response.ok || !response.body) {
+        const errorText = await response.text();
+        throw new Error(`Proxy API call for Gemini Stream failed with status ${response.status}: ${errorText}`);
     }
 
-    try {
-      return JSON.parse(responseText);
-    } catch (e) {
-      throw new Error(`Failed to parse JSON response from proxy. Response: ${responseText}`);
+    const stream = response.body.pipeThrough(new NdjsonParser());
+    const reader = stream.getReader();
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        yield value as GenerateContentResponse;
     }
   }
 
-  async findBestMatchBatch(
-    shoryRecords: { id: string, make: string, model: string }[],
-    icMakeModelList: { make: string; model: string; code?: string }[]
-  ): Promise<Map<string, WebSearchBatchResult>> {
-    const results = new Map<string, WebSearchBatchResult>();
-    if (shoryRecords.length === 0) return results;
+  private async _parseStreamedJson<T>(stream: AsyncGenerator<GenerateContentResponse, void, undefined>): Promise<T[]> {
+    let fullText = '';
+    for await (const chunk of stream) {
+        fullText += chunk.text;
+    }
 
-    const icListString = icMakeModelList
-      .map((item, index) => `${index + 1}. Make: "${item.make}", Model: "${item.model}"${item.code ? `, PrimaryCode: "${item.code}"` : ''}`)
-      .join('\n');
-    
-    const shoryListString = shoryRecords
-      .map(item => `ID: "${item.id}", Make: "${item.make}", Model: "${item.model}"`)
-      .join('\n');
+    // Now parse the newline-delimited JSON from the fully assembled text
+    return fullText.trim().split('\n')
+      .filter(line => line.trim() !== '')
+      .map(line => {
+        try {
+          return JSON.parse(line);
+        } catch (e) {
+          console.error("Failed to parse JSON object from final assembled text:", line, e);
+          return null;
+        }
+      })
+      .filter((item): item is T => item !== null);
+  }
 
-    const prompt = `You are an expert vehicle data mapper.
-Your task is to match a list of "Shory" vehicles with a vehicle from a single "Insurance Company (IC)" list.
-For each Shory vehicle, find the most accurate Make/Model match from the IC list.
-Prioritize matching MAKE first, then MODEL. Consider variations, typos, and abbreviations.
-Use web search to enhance your knowledge.
+  async *findBestMatchBatch(shoryRecords: { id: string, make: string, model: string }[], icMakeModelList: { make: string; model: string; code?: string }[]): AsyncGenerator<WebSearchBatchResult, void, undefined> {
+    if (shoryRecords.length === 0) return;
 
-Respond ONLY with a single JSON array, where each object corresponds to a Shory vehicle from the input list. The object must have this exact format:
-{
-  "shoryId": "THE_ORIGINAL_ID_OF_THE_SHORY_VEHICLE",
-  "matchedICMake": "MATCHED_IC_MAKE_OR_NULL",
-  "matchedICModel": "MATCHED_IC_MODEL_OR_NULL",
-  "matchedICCode": "THE_PRIMARY_CODE_OF_THE_MATCHED_IC_VEHICLE_OR_NULL",
-  "confidence": CONFIDENCE_SCORE_0_TO_1_OR_NULL,
-  "reason": "ONE_LINE_EXPLANATION"
-}
-If no confident match is found for a Shory vehicle, set its matched fields to null and confidence to a low value. Provide a reason.
+    const icListString = icMakeModelList.map(item => `Make: "${item.make}", Model: "${item.model}"${item.code ? `, PrimaryCode: "${item.code}"` : ''}`).join('\n');
+    const shoryListString = shoryRecords.map(item => `ID: "${item.id}", Make: "${item.make}", Model: "${item.model}"`).join('\n');
 
-Shory Vehicles List to Process:
+    const prompt = `You are an expert vehicle data mapper. For each Shory vehicle, find the best match from the IC list using web search.
+Respond ONLY with a stream of newline-delimited JSON objects, one for each Shory vehicle.
+Each JSON object must have this exact format:
+{ "shoryId": "...", "matchedICMake": "...", "matchedICModel": "...", "matchedICCode": "...", "confidence": 0.0-1.0, "reason": "..." }
+
+Shory Vehicles List:
 ${shoryListString}
 
 Insurance Company (IC) Vehicle List to Match Against:
-${icListString}
-`;
+${icListString}`;
     
+    let groundingSources: GroundingSource[] = [];
     try {
-        const response = await this._makeApiCall(prompt, [{googleSearch: {}}], 'application/json');
-        
-        const jsonString = response.text;
-        const parsedArray = this.parseJsonArrayResponse(jsonString) as WebSearchBatchResult[] | null;
-        
-        const groundingMetadata = response.groundingMetadata;
-        const groundingSources: GroundingSource[] = groundingMetadata?.groundingChunks
-            ?.map((chunk: any) => chunk.web)
-            .filter((web: any) => web?.uri)
-            .map((web: any) => ({ uri: web.uri, title: web.title || web.uri })) || [];
+        const stream = this._makeApiCallStream(prompt, [{googleSearch: {}}]);
+        let fullText = '';
+        for await (const chunk of stream) {
+            fullText += chunk.text;
+            const sources = chunk.candidates?.[0]?.groundingMetadata?.groundingChunks?.map((c: any) => c.web).filter((w: any) => w?.uri).map((w: any) => ({ uri: w.uri, title: w.title || w.uri })) || [];
+            if(sources.length > 0) groundingSources.push(...sources);
+        }
 
-        if (parsedArray) {
-            parsedArray.forEach(item => {
-            if (item && item.shoryId) {
-                item.groundingSources = groundingSources; 
-                results.set(item.shoryId, item);
-            }
-            });
+        const uniqueSources = Array.from(new Map(groundingSources.map(s => [s.uri, s])).values());
+
+        const results = fullText.trim().split('\n')
+            .filter(line => line.trim() !== '')
+            .map(line => {
+                try { return JSON.parse(line) as WebSearchBatchResult; } 
+                catch (e) { console.error("Failed to parse web search result line:", line, e); return null; }
+            }).filter((item): item is WebSearchBatchResult => item !== null);
+
+        for (const item of results) {
+            item.groundingSources = uniqueSources;
+            yield item;
         }
     } catch (error) {
-      console.error("Error calling Gemini API via proxy (Web Search Batch):", error);
-      shoryRecords.forEach(rec => {
-        results.set(rec.id, {
-          shoryId: rec.id,
-          matchedICMake: null, matchedICModel: null, matchedICCode: null, confidence: 0,
-          reason: `Gemini API Error: ${error instanceof Error ? error.message : "Unknown error"}`
-        });
-      });
-      if (error instanceof Error) throw error;
+        console.error("Error in Gemini Web Search Batch Stream:", error);
+        for (const rec of shoryRecords) {
+            yield { shoryId: rec.id, matchedICMake: null, matchedICModel: null, matchedICCode: null, confidence: 0, reason: `Gemini Stream Error: ${error instanceof Error ? error.message : "Unknown error"}`};
+        }
     }
-
-    return results;
   }
   
-  async semanticCompareWithLimitedListBatch(
-    tasks: SemanticBatchTask[]
-  ): Promise<Map<string, { matchedICInternalId: string | null; confidence: number | null; aiReason?: string }>> {
-    const results = new Map<string, { matchedICInternalId: string | null; confidence: number | null; aiReason?: string }>();
-    if (tasks.length === 0) return results;
+  async *semanticCompareWithLimitedListBatch(tasks: SemanticBatchTask[]): AsyncGenerator<SemanticLLMBatchResult, void, undefined> {
+    if (tasks.length === 0) return;
 
     const tasksString = tasks.map((task, taskIndex) => {
-      const candidateListString = task.candidates.map((item, index) => 
-        `${index + 1}. Make: "${item.originalMake}", Model: "${item.originalModel}"` +
-        (item.primaryCodeValue ? `, PrimaryCode: "${item.primaryCodeValue}"` : '')
-      ).join('\n');
-      
-      return `--- TASK ${taskIndex + 1} ---
-Shory Vehicle ID: "${task.shoryId}"
-Shory Vehicle to Match: Make: "${task.shoryMake}", Model: "${task.shoryModel}"
-Potential IC Matches for this task (Choose one or none):
-${candidateListString || "No candidates provided."}
-`;
+      const candidateListString = task.candidates.map((item, index) => `${index + 1}. Make: "${item.originalMake}", Model: "${item.originalModel}"`).join('\n');
+      return `--- TASK ${taskIndex + 1} ---\nShory Vehicle ID: "${task.shoryId}"\nShory Vehicle to Match: Make: "${task.shoryMake}", Model: "${task.shoryModel}"\nPotential IC Matches:\n${candidateListString || "No candidates."}`;
     }).join('\n');
 
-    const prompt = `You are a meticulous vehicle data analyst.
-For each task below, you must strictly follow these rules to find the best match for a "Shory" vehicle from its list of "Insurance Company (IC)" candidates.
-
-**Matching Rules:**
-1.  **VALIDATE MAKE:** The MAKE of the Shory vehicle and the IC candidate must be semantically identical or a very common abbreviation (e.g., "Mercedes-Benz" and "Mercedes" is OK). If the MAKES are different brands (e.g., "BYD" vs "AUDI"), it is NOT a match, even if the model name is similar.
-2.  **COMPARE MODEL:** ONLY if the MAKE is a valid match, you then compare the MODEL for the highest semantic similarity.
-3.  **REJECT IF NO MATCH:** If no candidate satisfies BOTH rules, you MUST indicate no match was found. Do not select the "least bad" option.
-
-**Example of what NOT to do (Invalid Match):**
-- Shory Vehicle: Make: "BYD", Model: "S6"
-- IC Candidate: Make: "AUDI", Model: "S6"
-- Correct decision: This is NOT a match because the makes (BYD, AUDI) are completely different.
-
-**Response Format:**
-Respond ONLY with a single JSON array, where each object corresponds to a task. The object must have this exact format:
-{
-  "shoryId": "THE_ORIGINAL_ID_FROM_THE_TASK",
-  "chosenICIndex": INDEX_OF_CHOSEN_IC_VEHICLE_FROM_LIST_OR_NULL,
-  "confidence": CONFIDENCE_SCORE_0_TO_1_OR_NULL,
-  "reason": "ONE_LINE_EXPLANATION of why the choice was made or rejected based on the rules."
-}
-The chosenICIndex must be the 1-based number from the list for that specific task. If no match, chosenICIndex must be null.
+    const prompt = `You are a meticulous vehicle data analyst. For each task, find the best match for a "Shory" vehicle from its "IC" candidates.
+**Rules:** 1. MAKES must be semantically identical. 2. If MAKES match, compare MODEL for similarity. 3. If no candidate satisfies BOTH, reject the match.
+**Response Format:** Respond ONLY with a stream of newline-delimited JSON objects, one for each task.
+Each JSON object must have this exact format:
+{ "shoryId": "...", "chosenICIndex": NUMBER_OR_NULL, "confidence": NUMBER_OR_NULL, "reason": "..." }
 
 --- TASKS ---
-${tasksString}
-`;
+${tasksString}`;
+    
     try {
-      const response = await this._makeApiCall(prompt);
-      const parsedArray = this.parseJsonArrayResponse(response.text) as SemanticLLMBatchResult[] | null;
-
-      if (parsedArray) {
-        parsedArray.forEach(item => {
-          if (item && item.shoryId) {
-            const originalTask = tasks.find(t => t.shoryId === item.shoryId);
-            if (!originalTask) return;
-            
-            let matchedICInternalId: string | null = null;
-            if (item.chosenICIndex !== null && typeof item.chosenICIndex === 'number') {
-              const index = item.chosenICIndex - 1; // 0-based
-              if (index >= 0 && index < originalTask.candidates.length) {
-                matchedICInternalId = originalTask.candidates[index].internalId;
-              }
-            }
-            results.set(item.shoryId, {
-              matchedICInternalId,
-              confidence: item.confidence,
-              aiReason: item.reason,
-            });
-          }
-        });
-      }
+        const stream = this._makeApiCallStream(prompt);
+        const results = await this._parseStreamedJson<SemanticLLMBatchResult>(stream);
+        for (const item of results) {
+            yield item;
+        }
     } catch (error) {
-      console.error("Error calling Gemini API via proxy (Semantic Batch):", error);
-      tasks.forEach(task => {
-        results.set(task.shoryId, {
-          matchedICInternalId: null, confidence: 0,
-          aiReason: `Gemini API Error: ${error instanceof Error ? error.message : "Unknown error"}`
-        });
-      });
-      if (error instanceof Error) throw error;
+      console.error("Error in Gemini Semantic Batch Stream:", error);
+      for (const task of tasks) {
+        yield { shoryId: task.shoryId, chosenICIndex: null, confidence: 0, reason: `Gemini Stream Error: ${error instanceof Error ? error.message : "Unknown error"}`};
+      }
     }
-    return results;
   }
 
   async generateRulesFromMatches(examples: RuleGenerationExample[]): Promise<LearnedRule[]> {
@@ -280,57 +199,33 @@ ${tasksString}
     
     const examplesString = examples.map(e => `- Shory (Make: "${e.shoryMake}", Model: "${e.shoryModel}") => IC (Make: "${e.icMake}", Model: "${e.icModel}")`).join('\n');
     
-    const prompt = `You are a data analyst creating a rule-based matching system.
-Based on the provided list of successful vehicle data matches, generate a set of generic, reusable matching rules.
-The rules should be logical and not overly specific to avoid overfitting.
-Focus on common patterns, abbreviations, and tokenizations.
-
-RULES:
-- A rule must contain one or more conditions.
-- A condition checks if a 'make' or 'model' field 'contains' or 'equals' a specific lowercase value.
-- Use 'contains' for partial matches and 'equals' for exact matches on normalized text.
-- Create a rule only if you can identify a clear, reusable pattern.
-- The action part of the rule must use the values from the IC (Insurance Company) side of the example.
-
-Respond ONLY with a single JSON array of rule objects. Each rule object must have this exact structure:
-{
-  "conditions": [
-    { "field": "make" | "model", "operator": "contains" | "equals", "value": "LOWERCASE_STRING" }
-  ],
-  "actions": { "setMake": "IC_MAKE_VALUE", "setModel": "IC_MODEL_VALUE" }
-}
-
-Example Input:
-- Shory (Make: "Toyota", Model: "Camry LE") => IC (Make: "TOYOTA", Model: "CAMRY 4D SDN LE")
-
-Example JSON output for the above:
-[
-  {
-    "conditions": [
-      { "field": "make", "operator": "equals", "value": "toyota" },
-      { "field": "model", "operator": "contains", "value": "camry" },
-      { "field": "model", "operator": "contains", "value": "le" }
-    ],
-    "actions": { "setMake": "TOYOTA", "setModel": "CAMRY 4D SDN LE" }
-  }
-]
-
-Here are the successful matches to analyze:
-${examplesString}
-`;
+    const prompt = `You are a data analyst. Based on the provided successful matches, generate generic, reusable matching rules.
+Respond ONLY with a single JSON array of rule objects. Each object must have this structure:
+{ "conditions": [{ "field": "make"|"model", "operator": "contains"|"equals", "value": "lowercase_string" }], "actions": { "setMake": "IC_MAKE_VALUE", "setModel": "IC_MODEL_VALUE" } }
+Successful matches:
+${examplesString}`;
     try {
-      const response = await this._makeApiCall(prompt);
-      const parsedArray = this.parseJsonArrayResponse(response.text);
+        // Rule generation can remain a single, non-streamed call for simplicity.
+        const stream = this._makeApiCallStream(prompt);
+        let fullText = '';
+        for await (const chunk of stream) {
+            fullText += chunk.text;
+        }
 
-      if (Array.isArray(parsedArray)) {
-        return parsedArray.filter(rule => 
-            rule && Array.isArray(rule.conditions) && rule.actions && rule.actions.setMake && rule.actions.setModel
-        ) as LearnedRule[];
-      }
-      return [];
+        let jsonStr = fullText.trim();
+        const fenceRegex = /^```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/;
+        const match = jsonStr.match(fenceRegex);
+        if (match && match[1]) jsonStr = match[1].trim();
 
+        const parsedData = JSON.parse(jsonStr);
+        const rules = Array.isArray(parsedData) ? parsedData : (parsedData.rules || []);
+
+        if (Array.isArray(rules)) {
+          return rules.filter(rule => rule && Array.isArray(rule.conditions) && rule.actions && rule.actions.setMake && rule.actions.setModel) as LearnedRule[];
+        }
+        return [];
     } catch(error) {
-      console.error("Error calling Gemini API via proxy (Rule Generation):", error);
+      console.error("Error calling Gemini API (Rule Generation):", error);
       if (error instanceof Error) throw error;
       return [];
     }

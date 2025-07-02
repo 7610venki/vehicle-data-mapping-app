@@ -1,5 +1,4 @@
 
-
 export interface GroundingSource {
   uri: string;
   title: string;
@@ -150,15 +149,23 @@ export interface RuleGenerationExample {
     icModel: string;
 }
 
+export interface GenerateContentResponse {
+  text: string;
+  candidates?: Array<{
+    content: { parts: Array<{ text: string }> };
+    groundingMetadata?: { groundingChunks?: Array<{ web: { uri: string; title: string } }> };
+  }>;
+}
+
 export interface LlmProvider {
     findBestMatchBatch(
         shoryRecords: { id: string, make: string, model: string }[],
         icMakeModelList: { make: string; model: string; code?: string }[]
-    ): Promise<Map<string, WebSearchBatchResult>>;
+    ): AsyncGenerator<WebSearchBatchResult, void, undefined>;
 
     semanticCompareWithLimitedListBatch(
         tasks: SemanticBatchTask[]
-    ): Promise<Map<string, { matchedICInternalId: string | null; confidence: number | null; aiReason?: string }>>;
+    ): AsyncGenerator<SemanticLLMBatchResult, void, undefined>;
 
     generateRulesFromMatches(examples: RuleGenerationExample[]): Promise<LearnedRule[]>;
 }
