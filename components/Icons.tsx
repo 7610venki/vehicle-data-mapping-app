@@ -4,6 +4,12 @@ import React from 'react';
 // General icon styling: using strokeWidth="1.5" or "1.75" for a lighter, modern feel.
 // Shadcn icons often use stroke-width of 1.5 or 2, depending on the icon.
 
+export const HelpCircleIcon: React.FC<{ className?: string }> = ({ className }) => (
+  <svg className={className} xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+    <circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><path d="M12 17h.01" />
+  </svg>
+);
+
 export const CheckIcon: React.FC<{ className?: string }> = ({ className }) => (
   <svg className={className} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth="2" stroke="currentColor" aria-hidden="true"> 
     <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />

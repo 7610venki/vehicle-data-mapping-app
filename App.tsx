@@ -17,7 +17,7 @@ import {
   ProgressCallback,
   KnowledgeBaseEntry,
 } from './types';
-import { APP_TITLE, STEPS_CONFIG, FUZZY_THRESHOLD_DEFAULT, GEMINI_MODEL_TEXT, CUSTOM_LLM_DEFAULT_MODEL } from './constants';
+import { APP_TITLE, STEPS_CONFIG, FUZZY_THRESHOLD_DEFAULT, GEMINI_MODEL_TEXT, CUSTOM_LLM_DEFAULT_MODEL, GITHUB_REPO_URL } from './constants';
 import { supabase } from './services/supabaseClient';
 import FileUpload from './components/FileUpload';
 import ColumnSelector from './components/ColumnSelector';
@@ -39,7 +39,7 @@ import { ExpandableTabs, TabItem } from './components/ui/expandable-tabs-1';
 import { DialogProvider, useDialog } from './components/DialogProvider';
 import { cn } from './lib/utils';
 import { 
-    ArrowRightIcon, DownloadIcon, SettingsIcon, RestartIcon, SaveIcon, LogOutIcon, CpuIcon, DatabaseZapIcon,
+    ArrowRightIcon, DownloadIcon, SettingsIcon, RestartIcon, SaveIcon, LogOutIcon, CpuIcon, DatabaseZapIcon, HelpCircleIcon,
 } from './components/Icons'; 
 import { FileUp, FilePlus2, ListChecks, Settings2, Table2 } from 'lucide-react';
 
@@ -82,7 +82,7 @@ function appReducer(state: AppState, action: AppAction): AppState {
   }
 }
 
-const AppCore: React.FC = () => {
+const AppCore = () => {
   const [state, dispatch] = useReducer(appReducer, initialState);
   const { isLoading, loadingMessage, error, progress } = state;
   const { alert, prompt } = useDialog();
@@ -667,7 +667,10 @@ const AppCore: React.FC = () => {
                 </p>
             </div>
             {session && (
-              <div className="absolute right-0 top-1/2 -translate-y-1/2">
+              <div className="absolute right-0 top-1/2 -translate-y-1/2 flex items-center gap-2">
+                <a href={GITHUB_REPO_URL} target="_blank" rel="noopener noreferrer" aria-label="Help and Documentation">
+                  <ActionButton variant="secondary" size="sm" icon={<HelpCircleIcon />}>Help</ActionButton>
+                </a>
                 <ActionButton variant="outline" size="sm" onClick={handleSignOut} icon={<LogOutIcon />}>Sign Out</ActionButton>
               </div>
             )}
@@ -712,7 +715,7 @@ const AppCore: React.FC = () => {
   );
 };
 
-const App: React.FC = () => (
+const App = () => (
   <DialogProvider>
     <AppCore />
   </DialogProvider>
