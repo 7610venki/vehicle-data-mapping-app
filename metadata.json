@@ -1,0 +1,6 @@
+{
+  "name": "Vehicle Data Mapping",
+  "description": "An  application to map vehicle data between Shory and Insurance Company files using fuzzy logic and Gemini AI LLM. Users can upload files, configure columns, and receive a comprehensive mapped output.",
+  "requestFramePermissions": [],
+  "prompt": ""
+}
