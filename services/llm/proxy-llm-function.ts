@@ -1,83 +1,113 @@
-
 // @ts-nocheck
-import { serve } from 'https://deno.land/std@0.224.0/http/server.ts';
-import { GoogleGenAI, HarmCategory, HarmBlockThreshold } from 'https://esm.sh/@google/genai@0.12.0';
 
+// Deno-deploy-specific imports
+// This is the single, unified proxy for all LLM providers.
+// Paste this code into the `proxy-llm` Edge Function in your Supabase dashboard.
+import { serve } from 'https://deno.land/std@0.224.0/http/server.ts';
+
+const GEMINI_API_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 const GROQ_API_ENDPOINT = 'https://api.groq.com/openai/v1/chat/completions';
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-provider-api-key',
-  'Content-Type': 'application/json',
 };
 
-// --- Helper for Gemini API Key Rotation ---
-function getGeminiApiKey() {
-    const geminiApiKeysString = Deno.env.get('GEMINI_API_KEYS');
-    if (!geminiApiKeysString) throw new Error('GEMINI_API_KEYS not configured on server.');
-    
-    const keys = geminiApiKeysString.split(',').map(k => k.trim()).filter(Boolean);
-    if (keys.length === 0) throw new Error('GEMINI_API_KEYS environment variable is empty.');
-
-    // Simple round-robin strategy for key selection
-    const index = parseInt(Deno.env.get('GEMINI_KEY_INDEX') || '0', 10);
-    const nextIndex = (index + 1) % keys.length;
-    Deno.env.set('GEMINI_KEY_INDEX', nextIndex.toString());
-    
-    return keys[index];
-}
-
 serve(async (req: Request) => {
+  // Handle CORS preflight requests
   if (req.method === 'OPTIONS') {
-    return new Response('ok', { headers: { ...CORS_HEADERS, 'Access-Control-Allow-Methods': 'POST, OPTIONS' } });
+    return new Response('ok', {
+      headers: { ...CORS_HEADERS, 'Access-Control-Allow-Methods': 'POST, OPTIONS' },
+    });
   }
 
   try {
-    const { provider, model, prompt, tools } = await req.json();
+    const { provider, model, prompt, tools, responseMimeType } = await req.json();
 
     if (!provider || !model || !prompt) {
-      return new Response(JSON.stringify({ error: 'Request must contain "provider", "model", and "prompt".' }), { status: 400, headers: CORS_HEADERS });
+      return new Response(JSON.stringify({ error: 'Request body must contain "provider", "model", and "prompt".' }), { status: 400, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
     }
 
-    if (provider === 'gemini') {
-      const apiKey = getGeminiApiKey();
-      const ai = new GoogleGenAI({ apiKey });
-      
-      let requestPayload;
+    let apiResponse;
+    let responseBody;
 
-      if (tools) {
-        // For tool-based calls (like Google Search), create a minimal payload.
-        // DO NOT include safetySettings or generationConfig as they are not supported with tools.
-        requestPayload = {
-          model,
-          contents: [{ parts: [{ text: prompt }] }],
-          config: {
-            tools: tools,
-          },
-        };
-      } else {
-        // For standard generation, include all configs.
-        const generationConfig = { temperature: 0.2, maxOutputTokens: 8192, responseMimeType: 'application/json' };
-        const safetySettings = [
-          { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-          { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
-          { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
-          { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-        ];
-        requestPayload = {
-          model,
-          contents: [{ parts: [{ text: prompt }] }],
-          safetySettings: safetySettings,
-          config: generationConfig,
-        };
+    if (provider === 'gemini') {
+      const geminiApiKeysString = Deno.env.get('GEMINI_API_KEYS');
+      if (!geminiApiKeysString) {
+        return new Response(JSON.stringify({ error: 'Gemini API keys are not configured on the server. Please set the GEMINI_API_KEYS environment variable in your Supabase project settings.' }), { status: 500, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
       }
       
-      const result = await ai.models.generateContent(requestPayload);
-      return new Response(JSON.stringify(result), { status: 200, headers: CORS_HEADERS });
+      const geminiApiKeys = geminiApiKeysString.split(',').map(k => k.trim()).filter(Boolean);
+      if (geminiApiKeys.length === 0) {
+        return new Response(JSON.stringify({ error: 'The GEMINI_API_KEYS environment variable is empty or incorrectly formatted. Please provide a comma-separated list of keys.' }), { status: 500, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
+      }
+
+      const generationConfig: {
+        temperature: number;
+        maxOutputTokens: number;
+        responseMimeType?: string;
+      } = {
+        temperature: 0.2,
+        maxOutputTokens: 8192,
+      };
+
+      if (!tools) {
+        generationConfig.responseMimeType = responseMimeType || 'application/json';
+      }
+
+      const geminiPayload = {
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: generationConfig,
+        ...(tools && { tools: tools }),
+      };
+      
+      let lastError = null;
+
+      for (const apiKey of geminiApiKeys) {
+        const endpoint = `${GEMINI_API_BASE_URL}/${model}:generateContent?key=${apiKey}`;
+        try {
+          apiResponse = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(geminiPayload),
+          });
+          
+          responseBody = await apiResponse.json();
+
+          if (apiResponse.ok) {
+            // Successful call, return the response immediately
+            const content = responseBody.candidates?.[0]?.content?.parts?.[0]?.text;
+            const responseObject = {
+              text: content,
+              groundingMetadata: responseBody.candidates?.[0]?.groundingMetadata
+            };
+            return new Response(JSON.stringify(responseObject), { status: 200, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
+          }
+          
+          // If the status is 400, it's a bad request. Don't retry with other keys.
+          if (apiResponse.status === 400) {
+             throw new Error(responseBody.error?.message || `Gemini API failed with status 400 (Bad Request). This indicates a problem with the prompt and will not be retried.`);
+          }
+
+          // For other errors (e.g., 429 quota, 401/403 key error, 5xx server error), log it and try the next key.
+          lastError = new Error(`Key ending in '...${apiKey.slice(-4)}' failed with status ${apiResponse.status}: ${responseBody.error?.message || 'No error message.'}`);
+          console.warn(lastError.message); // Log the failure and continue to the next key.
+
+        } catch (fetchErr) {
+          lastError = new Error(`A network or fetch error occurred for key ending in '...${apiKey.slice(-4)}': ${fetchErr.message}`);
+          console.warn(lastError.message);
+        }
+      }
+      
+      // If the loop completes, all keys have failed.
+      const finalErrorMessage = `All ${geminiApiKeys.length} Gemini API key(s) in the pool failed. Last known error: ${lastError?.message || 'An unknown error occurred.'}`;
+      return new Response(JSON.stringify({ error: finalErrorMessage }), { status: 503, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
 
     } else if (provider === 'custom') {
       const customApiKey = req.headers.get('x-provider-api-key');
-      if (!customApiKey) return new Response(JSON.stringify({ error: 'Missing X-Provider-Api-Key header for custom provider.' }), { status: 401, headers: CORS_HEADERS });
+      if (!customApiKey) {
+        return new Response(JSON.stringify({ error: 'Missing API key in X-Provider-Api-Key header for the custom provider (Groq).' }), { status: 401, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
+      }
 
       const customPayload = {
         model: model,
@@ -87,26 +117,34 @@ serve(async (req: Request) => {
         max_tokens: 4096,
       };
 
-      const apiResponse = await fetch(GROQ_API_ENDPOINT, {
+      apiResponse = await fetch(GROQ_API_ENDPOINT, {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${customApiKey}`, 'Content-Type': 'application/json' },
+        headers: {
+          'Authorization': `Bearer ${customApiKey}`,
+          'Content-Type': 'application/json',
+        },
         body: JSON.stringify(customPayload),
       });
-      const responseBody = await apiResponse.json();
-      if (!apiResponse.ok) throw new Error(responseBody.error?.message || `Custom Provider API failed with status ${apiResponse.status}`);
+      responseBody = await apiResponse.json();
       
+      if (!apiResponse.ok) {
+        throw new Error(responseBody.error?.message || `Custom Provider API failed with status ${apiResponse.status}`);
+      }
+
+      // For Groq/OpenAI-compatible, the response we want is a stringified JSON inside the 'content' field
       const content = responseBody.choices?.[0]?.message?.content;
       if (content) {
-        return new Response(content, { status: 200, headers: CORS_HEADERS });
+        // Return the content directly, as it's the JSON string the frontend expects
+        return new Response(content, { status: 200, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
       }
-      throw new Error("Custom provider response did not contain message content.");
+      throw new Error("Custom provider response did not contain the expected message content.");
 
     } else {
-      return new Response(JSON.stringify({ error: `Unsupported provider: ${provider}` }), { status: 400, headers: CORS_HEADERS });
+      return new Response(JSON.stringify({ error: `Unsupported provider: ${provider}` }), { status: 400, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
     }
 
   } catch (err) {
     console.error('Proxy function error:', err);
-    return new Response(JSON.stringify({ error: err.message || 'An unexpected error occurred.' }), { status: 500, headers: CORS_HEADERS });
+    return new Response(JSON.stringify({ error: err.message || 'An unexpected error occurred in the proxy.' }), { status: 500, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
   }
 });

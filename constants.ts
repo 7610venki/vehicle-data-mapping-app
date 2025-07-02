@@ -1,6 +1,5 @@
 
 
-
 // --- IMPORTANT: UPDATE YOUR CREDENTIALS HERE ---
 // API keys are now configured on the server-side in your Supabase Edge Function environment variables.
 // Do not store API keys in client-side code.
