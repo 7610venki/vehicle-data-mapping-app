@@ -95,24 +95,31 @@ export class GeminiProvider implements LlmProvider {
     }
   }
 
-  private async _parseStreamedJson<T>(stream: AsyncGenerator<GenerateContentResponse, void, undefined>): Promise<T[]> {
-    let fullText = '';
-    for await (const chunk of stream) {
-        fullText += chunk.text;
-    }
+  private async _makeApiCall(prompt: string): Promise<GenerateContentResponse> {
+    if (!supabaseUrl) throw new Error("Supabase URL is not configured.");
+    const proxyEndpoint = `${supabaseUrl}/functions/v1/proxy-llm`;
+    const { data: { session } } = await this.supabase.auth.getSession();
+    if (!session) throw new Error("User not authenticated.");
 
-    // Now parse the newline-delimited JSON from the fully assembled text
-    return fullText.trim().split('\n')
-      .filter(line => line.trim() !== '')
-      .map(line => {
-        try {
-          return JSON.parse(line);
-        } catch (e) {
-          console.error("Failed to parse JSON object from final assembled text:", line, e);
-          return null;
-        }
-      })
-      .filter((item): item is T => item !== null);
+    const body: any = { provider: 'gemini', model: this.model, prompt, stream: false };
+    
+    const response = await fetch(proxyEndpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${session.access_token}` },
+        body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Proxy API call for Gemini failed with status ${response.status}: ${errorText}`);
+    }
+    
+    const jsonResponse = await response.json();
+    // The Gemini non-streaming SDK response is nested. We extract the text here to match streaming's .text property.
+    return {
+        ...jsonResponse,
+        text: jsonResponse.candidates?.[0]?.content?.parts?.[0]?.text || ''
+    };
   }
 
   async *findBestMatchBatch(shoryRecords: { id: string, make: string, model: string }[], icMakeModelList: { make: string; model: string; code?: string }[]): AsyncGenerator<WebSearchBatchResult, void, undefined> {
@@ -132,28 +139,47 @@ ${shoryListString}
 Insurance Company (IC) Vehicle List to Match Against:
 ${icListString}`;
     
-    let groundingSources: GroundingSource[] = [];
+    let allGroundingSources: GroundingSource[] = [];
+    const uniqueSourceUris = new Set<string>();
+
     try {
         const stream = this._makeApiCallStream(prompt, [{googleSearch: {}}]);
-        let fullText = '';
+        let accumulatedText = '';
+
         for await (const chunk of stream) {
-            fullText += chunk.text;
+            accumulatedText += chunk.text;
+            
             const sources = chunk.candidates?.[0]?.groundingMetadata?.groundingChunks?.map((c: any) => c.web).filter((w: any) => w?.uri).map((w: any) => ({ uri: w.uri, title: w.title || w.uri })) || [];
-            if(sources.length > 0) groundingSources.push(...sources);
+            for (const source of sources) {
+                if (!uniqueSourceUris.has(source.uri)) {
+                    uniqueSourceUris.add(source.uri);
+                    allGroundingSources.push(source);
+                }
+            }
+
+            let lines = accumulatedText.split('\n');
+            accumulatedText = lines.pop() ?? '';
+
+            for (const line of lines) {
+                if (line.trim() === '') continue;
+                try {
+                    const result = JSON.parse(line) as WebSearchBatchResult;
+                    result.groundingSources = [...allGroundingSources];
+                    yield result;
+                } catch (e) {
+                    console.error("Failed to parse web search result line:", line, e);
+                }
+            }
         }
-
-        const uniqueSources = Array.from(new Map(groundingSources.map(s => [s.uri, s])).values());
-
-        const results = fullText.trim().split('\n')
-            .filter(line => line.trim() !== '')
-            .map(line => {
-                try { return JSON.parse(line) as WebSearchBatchResult; } 
-                catch (e) { console.error("Failed to parse web search result line:", line, e); return null; }
-            }).filter((item): item is WebSearchBatchResult => item !== null);
-
-        for (const item of results) {
-            item.groundingSources = uniqueSources;
-            yield item;
+        
+        if (accumulatedText.trim()) {
+            try {
+                const result = JSON.parse(accumulatedText) as WebSearchBatchResult;
+                result.groundingSources = [...allGroundingSources];
+                yield result;
+            } catch (e) {
+                console.error("Failed to parse final web search result chunk:", accumulatedText, e);
+            }
         }
     } catch (error) {
         console.error("Error in Gemini Web Search Batch Stream:", error);
@@ -182,9 +208,28 @@ ${tasksString}`;
     
     try {
         const stream = this._makeApiCallStream(prompt);
-        const results = await this._parseStreamedJson<SemanticLLMBatchResult>(stream);
-        for (const item of results) {
-            yield item;
+        let accumulatedText = '';
+        for await (const chunk of stream) {
+            accumulatedText += chunk.text;
+            let lines = accumulatedText.split('\n');
+            accumulatedText = lines.pop() ?? ''; // Keep incomplete line
+
+            for (const line of lines) {
+                if (line.trim() === '') continue;
+                try {
+                    yield JSON.parse(line) as SemanticLLMBatchResult;
+                } catch (e) {
+                    console.error("Failed to parse semantic result line:", line, e);
+                }
+            }
+        }
+        
+        if (accumulatedText.trim()) {
+            try {
+                yield JSON.parse(accumulatedText) as SemanticLLMBatchResult;
+            } catch (e) {
+                console.error("Failed to parse final semantic result chunk:", accumulatedText, e);
+            }
         }
     } catch (error) {
       console.error("Error in Gemini Semantic Batch Stream:", error);
@@ -205,14 +250,9 @@ Respond ONLY with a single JSON array of rule objects. Each object must have thi
 Successful matches:
 ${examplesString}`;
     try {
-        // Rule generation can remain a single, non-streamed call for simplicity.
-        const stream = this._makeApiCallStream(prompt);
-        let fullText = '';
-        for await (const chunk of stream) {
-            fullText += chunk.text;
-        }
-
-        let jsonStr = fullText.trim();
+        const response = await this._makeApiCall(prompt);
+        let jsonStr = response.text.trim();
+        
         const fenceRegex = /^```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/;
         const match = jsonStr.match(fenceRegex);
         if (match && match[1]) jsonStr = match[1].trim();

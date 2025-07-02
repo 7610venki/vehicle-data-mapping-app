@@ -52,10 +52,19 @@ serve(async (req: Request) => {
         { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
       ];
 
+      // Conditionally construct config. If tools are present, they are the ONLY config.
+      // This is to prevent "operation not supported" errors when using web search.
+      let config;
+      if (tools) {
+        config = { tools };
+      } else {
+        config = { ...generationConfig };
+      }
+
       const requestPayload = {
         model,
         contents: [{ parts: [{ text: prompt }] }],
-        config: { ...generationConfig, ...(tools && { tools }) },
+        config, // Use the conditionally constructed config
         safetySettings,
       };
 
