@@ -10,7 +10,7 @@ import {
     WebSearchBatchResult,
     GroundingSource 
 } from "../../types";
-import { GEMINI_MODEL_TEXT, MAX_IC_RECORDS_FOR_AI_PROMPT } from '../../constants';
+import { GEMINI_MODEL_TEXT } from '../../constants';
 import { supabaseUrl } from "../supabaseClient";
 
 
@@ -124,8 +124,7 @@ export class GeminiProvider implements LlmProvider {
     const results = new Map<string, WebSearchBatchResult>();
     if (shoryRecords.length === 0) return results;
 
-    const limitedICList = icMakeModelList.slice(0, MAX_IC_RECORDS_FOR_AI_PROMPT);
-    const icListString = limitedICList
+    const icListString = icMakeModelList
       .map((item, index) => `${index + 1}. Make: "${item.make}", Model: "${item.model}"${item.code ? `, PrimaryCode: "${item.code}"` : ''}`)
       .join('\n');
     

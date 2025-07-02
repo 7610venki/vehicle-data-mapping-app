@@ -2,6 +2,7 @@
 
 
 
+
 import {
   ShoryRecord,
   ICRecord,
@@ -20,6 +21,7 @@ import {
   SEMANTIC_LLM_BATCH_SIZE,
   AI_WEB_SEARCH_BATCH_SIZE,
   KNOWLEDGE_BASE_CONFIDENCE_THRESHOLD,
+  FUZZY_MAKE_SIMILARITY_THRESHOLD,
 } from '../constants';
 import { SessionService } from './sessionService';
 import { normalizeText, extractBaseModel } from './normalizationService';
@@ -205,109 +207,111 @@ export class MappingService {
         }
     }
     
-    // Layer 1: Learned Rules
+    // Layer 1: Learned Rules (with ambiguity check)
     if (useLearnedRulesLayer && learnedRules.length > 0 && recordsToProcessIds.size > 0) {
         for (const shoryRecord of finalResults) {
-            if (!shoryRecord.__shoryMake || !shoryRecord.__shoryModel || !recordsToProcessIds.has(shoryRecord.__id)) continue;
+            if (!recordsToProcessIds.has(shoryRecord.__id)) continue;
 
-            for(const rule of learnedRules) {
-                if(this.applyRule(shoryRecord, rule)) {
-                    const icRecord = icRecordsByOriginal.get(`${rule.actions.setMake}|${rule.actions.setModel}`);
-                    if(icRecord) {
-                        shoryRecord.matchStatus = MatchStatus.MATCHED_RULE;
-                        shoryRecord.matchedICMake = icRecord[icConfig.make] as string;
-                        shoryRecord.matchedICModel = icRecord[icConfig.model] as string;
-                        shoryRecord.matchedICCodes = icRecord.__icCodes;
-                        shoryRecord.matchConfidence = 1;
-                        shoryRecord.aiReason = "Matched by AI-generated rule.";
-                        recordsToProcessIds.delete(shoryRecord.__id);
-                        recordsProcessedCount++;
-                        if (onProgressUpdate) onProgressUpdate(shoryRecord, recordsProcessedCount - 1, totalRecords);
-                        break; // Move to next shory record
-                    }
+            const matchingRules = learnedRules.filter(rule => this.applyRule(shoryRecord, rule));
+
+            if (matchingRules.length === 1) {
+                const rule = matchingRules[0];
+                const icRecord = icRecordsByOriginal.get(`${rule.actions.setMake}|${rule.actions.setModel}`);
+                if (icRecord) {
+                    shoryRecord.matchStatus = MatchStatus.MATCHED_RULE;
+                    shoryRecord.matchedICMake = icRecord[icConfig.make] as string;
+                    shoryRecord.matchedICModel = icRecord[icConfig.model] as string;
+                    shoryRecord.matchedICCodes = icRecord.__icCodes;
+                    shoryRecord.matchConfidence = 1;
+                    shoryRecord.aiReason = "Matched by AI-generated rule.";
+                    recordsToProcessIds.delete(shoryRecord.__id);
+                    recordsProcessedCount++;
+                    if (onProgressUpdate) onProgressUpdate(shoryRecord, recordsProcessedCount - 1, totalRecords);
                 }
+            } else if (matchingRules.length > 1) {
+                // Ambiguous match, let it fall through to the next layer
+                shoryRecord.aiReason = `Ambiguous match: ${matchingRules.length} learned rules apply. Passing to next layer.`;
             }
         }
     }
 
-
-    // Layer 2: Fuzzy Matching (Exact Make + Fuzzy Base Model)
+    // Layer 2: Fuzzy Matching (with fuzzy make typo handling)
     if (useFuzzyLayer && recordsToProcessIds.size > 0) {
-      for (const shoryRecord of finalResults) {
-        if (!shoryRecord.__shoryMake || !shoryRecord.__shoryBaseModel || !recordsToProcessIds.has(shoryRecord.__id)) continue;
-        
-        // Calculate the best possible fuzzy score for reporting, regardless of threshold.
-        const allFuzzyCandidates = this.getTopNFuzzyCandidates(shoryRecord, processedIcRecords, icConfig, 1);
-        shoryRecord.actualFuzzyScore = allFuzzyCandidates.length > 0 ? allFuzzyCandidates[0].score : 0;
+        const makeFuzzyMatcher = new Fuse(processedIcRecords, { keys: ['__icMake'], includeScore: true, threshold: 1 - FUZZY_MAKE_SIMILARITY_THRESHOLD });
+        for (const shoryRecord of finalResults) {
+            if (!shoryRecord.__shoryMake || !shoryRecord.__shoryBaseModel || !recordsToProcessIds.has(shoryRecord.__id)) continue;
+            
+            // Calculate best possible fuzzy score for reporting, regardless of layer logic
+            const allFuzzyCandidates = this.getTopNFuzzyCandidates(shoryRecord, processedIcRecords, icConfig, 1);
+            shoryRecord.actualFuzzyScore = allFuzzyCandidates.length > 0 ? allFuzzyCandidates[0].score : 0;
 
-        // Apply the strict matching logic for the layer itself.
-        const icRecordsWithSameMake = processedIcRecords.filter(r => r.__icMake === shoryRecord.__shoryMake);
-        
-        if (icRecordsWithSameMake.length > 0) {
-          const modelFuzzyMatcher = new Fuse(icRecordsWithSameMake.filter(r => r.__icBaseModel), { 
-              keys: ['__icBaseModel'], 
-              includeScore: true, 
-              threshold: 1 - fuzzyThreshold // Fuse threshold is 0=perfect, 1=everything
-          });
-          const modelMatches: FuzzyMatchResult[] = modelFuzzyMatcher.search(shoryRecord.__shoryBaseModel)
-            .map((res: any) => ({ 
-                item: res.item, 
-                score: 1 - res.score, 
-                originalMake: res.item[icConfig.make] as string, 
-                originalModel: res.item[icConfig.model] as string, 
-                originalCodes: res.item.__icCodes 
-            }));
+            let icRecordsForModelMatch = processedIcRecords.filter(r => r.__icMake === shoryRecord.__shoryMake);
+            let reasonForFuzzyMatch = "Matched by exact make and fuzzy base model.";
+            
+            // --- NEW: Handle Make Typos ---
+            if (icRecordsForModelMatch.length === 0) {
+                const makeMatches = makeFuzzyMatcher.search(shoryRecord.__shoryMake!);
+                if (makeMatches.length > 0) {
+                    const bestMakeMatch = makeMatches[0];
+                    const matchedMake = bestMakeMatch.item.__icMake;
+                    icRecordsForModelMatch = processedIcRecords.filter(r => r.__icMake === matchedMake);
+                    reasonForFuzzyMatch = `Matched by fuzzy make ('${shoryRecord.__shoryMake}' -> '${matchedMake}') and fuzzy base model.`;
+                }
+            }
 
-          if (modelMatches.length > 0) {
-              const bestModelMatch = modelMatches.sort((a,b) => b.score - a.score)[0];
-              shoryRecord.matchStatus = MatchStatus.MATCHED_FUZZY;
-              shoryRecord.matchedICMake = bestModelMatch.originalMake;
-              shoryRecord.matchedICModel = bestModelMatch.originalModel;
-              shoryRecord.matchedICCodes = bestModelMatch.originalCodes;
-              shoryRecord.matchConfidence = bestModelMatch.score;
-              shoryRecord.aiReason = "Matched by exact make and fuzzy base model.";
-              recordsToProcessIds.delete(shoryRecord.__id);
-          }
+            if (icRecordsForModelMatch.length > 0) {
+                const modelFuzzyMatcher = new Fuse(icRecordsForModelMatch.filter(r => r.__icBaseModel), { 
+                    keys: ['__icBaseModel'], 
+                    includeScore: true, 
+                    threshold: 1 - fuzzyThreshold // Fuse threshold is 0=perfect, 1=everything
+                });
+                const modelMatches: FuzzyMatchResult[] = modelFuzzyMatcher.search(shoryRecord.__shoryBaseModel)
+                    .map((res: any) => ({ 
+                        item: res.item, 
+                        score: 1 - res.score, 
+                        originalMake: res.item[icConfig.make] as string, 
+                        originalModel: res.item[icConfig.model] as string, 
+                        originalCodes: res.item.__icCodes 
+                    }));
+
+                if (modelMatches.length > 0) {
+                    const bestModelMatch = modelMatches.sort((a,b) => b.score - a.score)[0];
+                    shoryRecord.matchStatus = MatchStatus.MATCHED_FUZZY;
+                    shoryRecord.matchedICMake = bestModelMatch.originalMake;
+                    shoryRecord.matchedICModel = bestModelMatch.originalModel;
+                    shoryRecord.matchedICCodes = bestModelMatch.originalCodes;
+                    shoryRecord.matchConfidence = bestModelMatch.score;
+                    shoryRecord.aiReason = reasonForFuzzyMatch;
+                    recordsToProcessIds.delete(shoryRecord.__id);
+                }
+            }
+            
+            if (onProgressUpdate && !recordsToProcessIds.has(shoryRecord.__id)) {
+                recordsProcessedCount++;
+                onProgressUpdate(shoryRecord, recordsProcessedCount -1, totalRecords);
+            }
         }
-        
-        if (onProgressUpdate && !recordsToProcessIds.has(shoryRecord.__id)) {
-            recordsProcessedCount++;
-            onProgressUpdate(shoryRecord, recordsProcessedCount -1, totalRecords);
-        }
-      }
     }
 
-    // Layer 3: Advanced AI Matching (Hybrid Semantic/Web Search)
+    // Layer 3: Advanced AI Matching (with "Second Chance" Web Search)
     if (useAdvancedAiLayer && this.llmProvider && recordsToProcessIds.size > 0) {
         const semanticTasks: SemanticBatchTask[] = [];
-        const webSearchTasks: MappedRecord[] = [];
+        let webSearchTasks: MappedRecord[] = [];
 
-        // Strategically divide remaining records into semantic or web search tasks
         finalResults.forEach(rec => {
             if (recordsToProcessIds.has(rec.__id) && rec.__shoryMake && rec.__shoryModel) {
                 const candidates = this.getTopNFuzzyCandidates(rec, processedIcRecords, icConfig, TOP_N_CANDIDATES_FOR_SEMANTIC_LLM);
+                if (candidates.length > 0) rec.allSemanticMatches = candidates.map(c => c.model!);
                 
-                // Store all potential semantic candidates for later display
                 if (candidates.length > 0) {
-                    rec.allSemanticMatches = candidates.map(c => c.model!);
-                }
-
-                if (candidates.length > 0) {
-                    // If we have good fuzzy candidates, use the cheaper/faster semantic comparison
-                    semanticTasks.push({
-                        shoryId: rec.__id,
-                        shoryMake: rec[shoryConfig.make] as string,
-                        shoryModel: rec[shoryConfig.model] as string,
-                        candidates: candidates.map(c => ({ originalMake: c.make!, originalModel: c.model!, originalCodes: c.codes, primaryCodeValue: (icConfig.codes?.[0] && c.codes) ? c.codes[icConfig.codes[0]] : undefined, internalId: c.internalId }))
-                    });
+                    semanticTasks.push({ shoryId: rec.__id, shoryMake: rec[shoryConfig.make] as string, shoryModel: rec[shoryConfig.model] as string, candidates: candidates.map(c => ({ originalMake: c.make!, originalModel: c.model!, originalCodes: c.codes, primaryCodeValue: (icConfig.codes?.[0] && c.codes) ? c.codes[icConfig.codes[0]] : undefined, internalId: c.internalId })) });
                 } else if ('findBestMatchBatch' in this.llmProvider!) {
-                    // If no good candidates, escalate to the more powerful web search (if provider supports it)
                     webSearchTasks.push(rec);
                 }
             }
         });
         
-        // --- Process Semantic Tasks ---
+        const semanticFailuresToRetry: MappedRecord[] = [];
         const semanticBatches = chunk(semanticTasks, SEMANTIC_LLM_BATCH_SIZE);
         for (const batch of semanticBatches) {
             batch.forEach(task => {
@@ -339,7 +343,13 @@ export class MappingService {
                          finalResults[recordIndex].matchStatus = MatchStatus.ERROR_AI;
                          finalResults[recordIndex].aiReason = "Semantic AI chose an ID not found. " + (result.aiReason || "");
                     }
+                } else {
+                    // --- NEW: Second Chance Logic ---
+                    // This failed semantic match should be retried with web search.
+                    semanticFailuresToRetry.push(finalResults[recordIndex]);
+                    finalResults[recordIndex].aiReason = "Semantic AI found no match; escalating to web search. " + (result.aiReason || "");
                 }
+
                 if (onProgressUpdate) {
                     recordsProcessedCount++;
                     onProgressUpdate(finalResults[recordIndex], recordsProcessedCount - 1, totalRecords);
@@ -347,27 +357,20 @@ export class MappingService {
             }
         }
 
-        // --- Process Web Search Tasks ---
-        const webSearchBatches = chunk(webSearchTasks, AI_WEB_SEARCH_BATCH_SIZE);
+        const allWebSearchTasks = [...webSearchTasks, ...semanticFailuresToRetry];
+        const webSearchBatches = chunk(allWebSearchTasks, AI_WEB_SEARCH_BATCH_SIZE);
         for (const batch of webSearchBatches) {
              batch.forEach(rec => {
                 rec.matchStatus = MatchStatus.PROCESSING_AI;
                 rec.aiReason = "AI (web search) processing...";
                 if(onProgressUpdate) onProgressUpdate(rec, recordsProcessedCount + batch.indexOf(rec), totalRecords);
             });
-
-            // Create a tailored, relevant IC list for this specific batch to give the AI better context.
             const uniqueMakesInBatch = [...new Set(batch.map(r => r.__shoryMake).filter((m): m is string => !!m))];
-            const relevantIcRecords = processedIcRecords.filter(icRec => 
-              uniqueMakesInBatch.includes(icRec.__icMake!)
-            );
-            
-            // If filtering results in an empty list (e.g., all makes in batch are new), 
-            // fall back to the full list to give the AI a chance. Otherwise, use the filtered list.
+            const relevantIcRecords = processedIcRecords.filter(icRec => uniqueMakesInBatch.includes(icRec.__icMake!));
             const icListForPrompt = relevantIcRecords.length > 0 ? relevantIcRecords : processedIcRecords;
 
             const batchResults = await this.llmProvider.findBestMatchBatch(
-                batch.map(r => ({ id: r.__id, make: r[shoryConfig.make] as string, model: r[shoryConfig.model] as string })), // Send original make/model to AI
+                batch.map(r => ({ id: r.__id, make: r[shoryConfig.make] as string, model: r[shoryConfig.model] as string })),
                 icListForPrompt.map(r => ({ make: r[icConfig.make] as string, model: r[icConfig.model] as string, code: (icConfig.codes?.[0] && r.__icCodes) ? r.__icCodes[icConfig.codes[0]] : undefined}))
             );
 
