@@ -41,20 +41,18 @@ export class CustomProvider implements LlmProvider {
     catch (e) { throw new Error(`Failed to parse JSON response from proxy. Response: ${responseBody}`); }
   }
   
-  async *findBestMatchBatch(shoryRecords: { id: string; make: string; model: string; }[]): AsyncGenerator<WebSearchBatchResult, void, undefined> {
+  async findBestMatchBatch(shoryRecords: { id: string; make: string; model: string; }[]): Promise<WebSearchBatchResult[]> {
     console.warn("findBestMatchBatch (Web Search) is not supported by the CustomProvider and was called.");
-    for(const rec of shoryRecords) {
-        yield {
-            shoryId: rec.id,
-            matchedICMake: null, matchedICModel: null, matchedICCode: null,
-            confidence: 0,
-            reason: "Web Search layer is not available for custom LLM providers.",
-        };
-    }
+    return Promise.resolve(shoryRecords.map(rec => ({
+        shoryId: rec.id,
+        matchedICMake: null, matchedICModel: null, matchedICCode: null,
+        confidence: 0,
+        reason: "Web Search layer is not available for custom LLM providers.",
+    })));
   }
 
-  async *semanticCompareWithLimitedListBatch(tasks: SemanticBatchTask[]): AsyncGenerator<SemanticLLMBatchResult, void, undefined> {
-    if (tasks.length === 0) return;
+  async semanticCompareWithLimitedListBatch(tasks: SemanticBatchTask[]): Promise<SemanticLLMBatchResult[]> {
+    if (tasks.length === 0) return [];
 
     const tasksString = tasks.map((task, taskIndex) => {
       const candidateListString = task.candidates.map((item, index) => `${index + 1}. Make: "${item.originalMake}", Model: "${item.originalModel}"`).join('\n');
@@ -71,19 +69,13 @@ export class CustomProvider implements LlmProvider {
       const parsedArray = response.results;
 
       if (parsedArray && Array.isArray(parsedArray)) {
-        for (const item of parsedArray) {
-          if (item && item.shoryId) {
-            yield item;
-          }
-        }
+        return parsedArray.filter(item => item && item.shoryId);
       } else {
         throw new Error("The 'results' key was not found or was not an array in the LLM's JSON response.");
       }
     } catch (error) {
       console.error("Error calling Custom LLM API (Semantic Batch):", error);
-      for (const task of tasks) {
-        yield { shoryId: task.shoryId, chosenICIndex: null, confidence: 0, reason: `Custom LLM API Error: ${error instanceof Error ? error.message : "Unknown error"}`};
-      }
+      return tasks.map(task => ({ shoryId: task.shoryId, chosenICIndex: null, confidence: 0, reason: `Custom LLM API Error: ${error instanceof Error ? error.message : "Unknown error"}`}));
     }
   }
 

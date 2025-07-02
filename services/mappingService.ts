@@ -177,7 +177,9 @@ export class MappingService {
         for (const batch of semanticBatches) {
             batch.forEach(task => { finalResults[findRecordIndexById(task.shoryId)].matchStatus = MatchStatus.PROCESSING_SEMANTIC_LLM; });
             
-            for await (const result of this.llmProvider.semanticCompareWithLimitedListBatch(batch)) {
+            const semanticResults = await this.llmProvider.semanticCompareWithLimitedListBatch(batch);
+
+            for (const result of semanticResults) {
                 const recordIndex = findRecordIndexById(result.shoryId);
                 if (recordIndex === -1) continue;
                 finalResults[recordIndex].aiReason = result.reason;
@@ -207,7 +209,9 @@ export class MappingService {
             const relevantIcRecords = processedIcRecords.filter(icRec => uniqueMakesInBatch.includes(icRec.__icMake!));
             const icListForPrompt = relevantIcRecords.length > 0 ? relevantIcRecords : processedIcRecords;
 
-            for await (const result of this.llmProvider.findBestMatchBatch(batch.map(r => ({ id: r.__id, make: r[shoryConfig.make] as string, model: r[shoryConfig.model] as string })), icListForPrompt.map(r => ({ make: r[icConfig.make] as string, model: r[icConfig.model] as string, code: (icConfig.codes?.[0] && r.__icCodes) ? r.__icCodes[icConfig.codes[0]] : undefined })))) {
+            const webResults = await this.llmProvider.findBestMatchBatch(batch.map(r => ({ id: r.__id, make: r[shoryConfig.make] as string, model: r[shoryConfig.model] as string })), icListForPrompt.map(r => ({ make: r[icConfig.make] as string, model: r[icConfig.model] as string, code: (icConfig.codes?.[0] && r.__icCodes) ? r.__icCodes[icConfig.codes[0]] : undefined })));
+            
+            for (const result of webResults) {
                 const recordIndex = findRecordIndexById(result.shoryId);
                 if (recordIndex === -1) continue;
                 

@@ -27,14 +27,13 @@ function getGeminiApiKey() {
     return keys[index];
 }
 
-
 serve(async (req: Request) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: { ...CORS_HEADERS, 'Access-Control-Allow-Methods': 'POST, OPTIONS' } });
   }
 
   try {
-    const { provider, model, prompt, tools, stream } = await req.json();
+    const { provider, model, prompt, tools } = await req.json();
 
     if (!provider || !model || !prompt) {
       return new Response(JSON.stringify({ error: 'Request must contain "provider", "model", and "prompt".' }), { status: 400, headers: CORS_HEADERS });
@@ -44,51 +43,37 @@ serve(async (req: Request) => {
       const apiKey = getGeminiApiKey();
       const ai = new GoogleGenAI({ apiKey });
       
-      const generationConfig = { temperature: 0.2, maxOutputTokens: 8192 };
-      const safetySettings = [
-        { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-        { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
-        { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
-        { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-      ];
+      let requestPayload;
 
-      // Conditionally construct config. If tools are present, they are the ONLY config.
-      // This is to prevent "operation not supported" errors when using web search.
-      let config;
       if (tools) {
-        config = { tools };
+        // For tool-based calls (like Google Search), create a minimal payload.
+        // DO NOT include safetySettings or generationConfig as they are not supported with tools.
+        requestPayload = {
+          model,
+          contents: [{ parts: [{ text: prompt }] }],
+          config: {
+            tools: tools,
+          },
+        };
       } else {
-        config = { ...generationConfig };
+        // For standard generation, include all configs.
+        const generationConfig = { temperature: 0.2, maxOutputTokens: 8192, responseMimeType: 'application/json' };
+        const safetySettings = [
+          { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+          { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+          { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+          { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+        ];
+        requestPayload = {
+          model,
+          contents: [{ parts: [{ text: prompt }] }],
+          safetySettings: safetySettings,
+          config: generationConfig,
+        };
       }
-
-      const requestPayload = {
-        model,
-        contents: [{ parts: [{ text: prompt }] }],
-        config, // Use the conditionally constructed config
-        safetySettings,
-      };
-
-      if (stream) {
-        const streamingResult = await ai.models.generateContentStream(requestPayload);
-        
-        // Pipe the stream from the SDK to the response
-        const responseStream = new ReadableStream({
-          async start(controller) {
-            const encoder = new TextEncoder();
-            for await (const chunk of streamingResult) {
-              // Each chunk is a GenerateContentResponse object. Stringify it and send.
-              const chunkText = JSON.stringify(chunk) + '\n';
-              controller.enqueue(encoder.encode(chunkText));
-            }
-            controller.close();
-          }
-        });
-        return new Response(responseStream, { headers: { ...CORS_HEADERS, 'Content-Type': 'application/x-ndjson' } });
-
-      } else { // Non-streaming request
-        const result = await ai.models.generateContent(requestPayload);
-        return new Response(JSON.stringify(result), { status: 200, headers: CORS_HEADERS });
-      }
+      
+      const result = await ai.models.generateContent(requestPayload);
+      return new Response(JSON.stringify(result), { status: 200, headers: CORS_HEADERS });
 
     } else if (provider === 'custom') {
       const customApiKey = req.headers.get('x-provider-api-key');

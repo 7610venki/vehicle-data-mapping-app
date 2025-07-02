@@ -161,11 +161,11 @@ export interface LlmProvider {
     findBestMatchBatch(
         shoryRecords: { id: string, make: string, model: string }[],
         icMakeModelList: { make: string; model: string; code?: string }[]
-    ): AsyncGenerator<WebSearchBatchResult, void, undefined>;
+    ): Promise<WebSearchBatchResult[]>;
 
     semanticCompareWithLimitedListBatch(
         tasks: SemanticBatchTask[]
-    ): AsyncGenerator<SemanticLLMBatchResult, void, undefined>;
+    ): Promise<SemanticLLMBatchResult[]>;
 
     generateRulesFromMatches(examples: RuleGenerationExample[]): Promise<LearnedRule[]>;
 }
