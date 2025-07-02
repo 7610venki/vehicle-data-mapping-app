@@ -45,6 +45,7 @@ export class CustomProvider implements LlmProvider {
             'X-Provider-Api-Key': this.apiKey,
         },
         body: JSON.stringify({
+            provider: 'custom', // Crucial fix: Identify the provider to the proxy
             model: this.model,
             prompt: prompt
         }),
@@ -52,10 +53,11 @@ export class CustomProvider implements LlmProvider {
 
     const responseBody = await response.text();
     if (!response.ok) {
-        throw new Error(`Proxy API call failed with status ${response.status}: ${responseBody}`);
+        throw new Error(`Proxy API call for Custom Provider failed with status ${response.status}: ${responseBody}`);
     }
 
     try {
+        // The Custom provider proxy returns the JSON text directly in the body
         return JSON.parse(responseBody);
     } catch (e) {
         throw new Error(`Failed to parse JSON response from proxy. Response: ${responseBody}`);

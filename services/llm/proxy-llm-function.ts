@@ -1,8 +1,10 @@
+// @ts-nocheck
+
 /// <reference types="https://deno.land/x/deno/globals.d.ts" />
 
 // Deno-deploy-specific imports
-// Note: This code is intended to be pasted into the `index.ts` file
-// of an Edge Function named `proxy-llm` in your Supabase dashboard.
+// This is the single, unified proxy for all LLM providers.
+// Paste this code into the `proxy-llm` Edge Function in your Supabase dashboard.
 import { serve } from 'https://deno.land/std@0.224.0/http/server.ts';
 
 const GEMINI_API_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
@@ -29,11 +31,12 @@ serve(async (req: Request) => {
     }
 
     let apiResponse;
+    let responseBody;
 
     if (provider === 'gemini') {
       const geminiApiKey = Deno.env.get('GEMINI_API_KEY');
       if (!geminiApiKey) {
-        return new Response(JSON.stringify({ error: 'Gemini API key is not configured on the server.' }), { status: 500, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify({ error: 'Gemini API key is not configured on the server. Please set GEMINI_API_KEY in your Supabase project settings.' }), { status: 500, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
       }
 
       const geminiPayload = {
@@ -43,7 +46,7 @@ serve(async (req: Request) => {
           maxOutputTokens: 8192,
           responseMimeType: responseMimeType || 'application/json',
         },
-        ...(tools && { tools: tools }), // Add tools if provided (for web search)
+        ...(tools && { tools: tools }),
       };
       
       const endpoint = `${GEMINI_API_BASE_URL}/${model}:generateContent?key=${geminiApiKey}`;
@@ -53,14 +56,27 @@ serve(async (req: Request) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(geminiPayload),
       });
+      responseBody = await apiResponse.json();
 
-    } else if (provider === 'custom') { // Assuming 'custom' is Groq
-      const groqApiKey = req.headers.get('x-provider-api-key');
-      if (!groqApiKey) {
-        return new Response(JSON.stringify({ error: 'Missing API key in X-Provider-Api-Key header for custom provider.' }), { status: 401, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
+      if (!apiResponse.ok) {
+        throw new Error(responseBody.error?.message || `Gemini API failed with status ${apiResponse.status}`);
+      }
+      
+      // For Gemini, we return a structured object with the text and any grounding metadata
+      const content = responseBody.candidates?.[0]?.content?.parts?.[0]?.text;
+      const responseObject = {
+        text: content,
+        groundingMetadata: responseBody.candidates?.[0]?.groundingMetadata
+      };
+      return new Response(JSON.stringify(responseObject), { status: 200, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
+
+    } else if (provider === 'custom') {
+      const customApiKey = req.headers.get('x-provider-api-key');
+      if (!customApiKey) {
+        return new Response(JSON.stringify({ error: 'Missing API key in X-Provider-Api-Key header for the custom provider (Groq).' }), { status: 401, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
       }
 
-      const groqPayload = {
+      const customPayload = {
         model: model,
         messages: [{ role: 'user', content: prompt }],
         response_format: { type: 'json_object' },
@@ -71,46 +87,28 @@ serve(async (req: Request) => {
       apiResponse = await fetch(GROQ_API_ENDPOINT, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${groqApiKey}`,
+          'Authorization': `Bearer ${customApiKey}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(groqPayload),
+        body: JSON.stringify(customPayload),
       });
+      responseBody = await apiResponse.json();
+      
+      if (!apiResponse.ok) {
+        throw new Error(responseBody.error?.message || `Custom Provider API failed with status ${apiResponse.status}`);
+      }
+
+      // For Groq/OpenAI-compatible, the response we want is a stringified JSON inside the 'content' field
+      const content = responseBody.choices?.[0]?.message?.content;
+      if (content) {
+        // Return the content directly, as it's the JSON string the frontend expects
+        return new Response(content, { status: 200, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
+      }
+      throw new Error("Custom provider response did not contain the expected message content.");
 
     } else {
       return new Response(JSON.stringify({ error: `Unsupported provider: ${provider}` }), { status: 400, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
     }
-
-    const data = await apiResponse.json();
-
-    if (!apiResponse.ok) {
-      const errorMessage = data.error?.message || `Provider API failed with status ${apiResponse.status}`;
-      console.error("LLM Provider Error:", data);
-      return new Response(JSON.stringify({ error: errorMessage, details: data.error }), { status: apiResponse.status, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
-    }
-    
-    let content;
-    if (provider === 'gemini') {
-      content = data.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (content) {
-        // For Gemini, we return a structured object with the text and any grounding metadata
-        const responseObject = {
-          text: content,
-          groundingMetadata: data.candidates?.[0]?.groundingMetadata
-        };
-        return new Response(JSON.stringify(responseObject), { status: 200, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
-      }
-    } else { // Handle Groq/OpenAI-compatible responses
-      content = data.choices?.[0]?.message?.content;
-      if (content) {
-        // The content is the stringified JSON we want. Return it directly.
-        return new Response(content, { status: 200, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
-      }
-    }
-
-    const fallbackError = "LLM response did not contain the expected message content.";
-    console.error(fallbackError, data);
-    return new Response(JSON.stringify({ error: fallbackError }), { status: 500, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
 
   } catch (err) {
     console.error('Proxy function error:', err);
