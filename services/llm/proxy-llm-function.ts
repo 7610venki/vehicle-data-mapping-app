@@ -42,6 +42,7 @@ serve(async (req: Request) => {
         return new Response(JSON.stringify({ error: 'The GEMINI_API_KEYS environment variable is empty or incorrectly formatted. Please provide a comma-separated list of keys.' }), { status: 500, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
       }
 
+      // This is the generationConfig object for the raw REST API call.
       const generationConfig: {
         temperature: number;
         maxOutputTokens: number;
@@ -51,19 +52,23 @@ serve(async (req: Request) => {
         maxOutputTokens: 8192,
       };
 
+      // Per the latest guidelines, do not send responseMimeType when tools are used (e.g., googleSearch).
       if (!tools) {
         generationConfig.responseMimeType = responseMimeType || 'application/json';
       }
 
+      // The raw Gemini REST API payload uses a 'generationConfig' object.
+      // The '@google/genai' SDK abstracts this to 'config', but we're making a direct fetch call.
       const geminiPayload = {
         contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: generationConfig,
+        generationConfig: generationConfig, // Use 'generationConfig' for raw REST API calls
         ...(tools && { tools: tools }),
       };
       
       let lastError = null;
 
       for (const apiKey of geminiApiKeys) {
+        // The endpoint uses the v1beta model name and the standard generateContent action.
         const endpoint = `${GEMINI_API_BASE_URL}/${model}:generateContent?key=${apiKey}`;
         try {
           apiResponse = await fetch(endpoint, {
@@ -75,7 +80,8 @@ serve(async (req: Request) => {
           responseBody = await apiResponse.json();
 
           if (apiResponse.ok) {
-            // Successful call, return the response immediately
+            // Successful call, return the response immediately.
+            // The raw REST response nests the text inside candidates.
             const content = responseBody.candidates?.[0]?.content?.parts?.[0]?.text;
             const responseObject = {
               text: content,
@@ -84,13 +90,15 @@ serve(async (req: Request) => {
             return new Response(JSON.stringify(responseObject), { status: 200, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
           }
           
-          // If the status is 400, it's a bad request. Don't retry with other keys.
+          const errorMessage = responseBody.error?.message || `Gemini API failed with status ${apiResponse.status}`;
+
+          // If the status is 400, it's a bad request (e.g., malformed prompt). Don't retry with other keys.
           if (apiResponse.status === 400) {
-             throw new Error(responseBody.error?.message || `Gemini API failed with status 400 (Bad Request). This indicates a problem with the prompt and will not be retried.`);
+             throw new Error(`${errorMessage} (Bad Request). This indicates a problem with the prompt data and will not be retried.`);
           }
 
           // For other errors (e.g., 429 quota, 401/403 key error, 5xx server error), log it and try the next key.
-          lastError = new Error(`Key ending in '...${apiKey.slice(-4)}' failed with status ${apiResponse.status}: ${responseBody.error?.message || 'No error message.'}`);
+          lastError = new Error(`Key ending in '...${apiKey.slice(-4)}' failed with status ${apiResponse.status}: ${errorMessage}`);
           console.warn(lastError.message); // Log the failure and continue to the next key.
 
         } catch (fetchErr) {

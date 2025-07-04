@@ -306,7 +306,14 @@ const AppCore = () => {
 
       setCurrentStep(AppStep.SHOW_RESULTS);
     } catch (err: any) {
-      dispatch({ type: 'SET_ERROR', payload: `Error during mapping: ${err.message}` });
+      const errorMessage = err.message || "An unknown error occurred during mapping.";
+      const userFriendlyMessage = `The mapping process was interrupted due to a service error: "${errorMessage}". You can view the results that were successfully processed before the interruption. The AI service may be temporarily overloaded.`;
+      
+      // Dispatch an error that will be displayed as an Alert, but don't halt the flow.
+      dispatch({ type: 'SET_ERROR', payload: userFriendlyMessage });
+      
+      // Navigate to the results page to show the partial data
+      setCurrentStep(AppStep.SHOW_RESULTS);
     } finally {
       dispatch({ type: 'STOP_LOADING' });
     }

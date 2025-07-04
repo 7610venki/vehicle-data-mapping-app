@@ -76,45 +76,71 @@ export class GeminiProvider implements LlmProvider {
     tools?: any,
     responseMimeType: string = "application/json"
   ): Promise<any> {
-    if (!supabaseUrl) {
-      throw new Error("Supabase URL is not configured. Cannot contact the proxy Edge Function.");
-    }
-    const proxyEndpoint = `${supabaseUrl}/functions/v1/proxy-llm`;
+    const maxRetries = 3;
+    let attempt = 0;
+    let delay = 1000; // Start with 1 second
 
-    const { data: { session } } = await this.supabase.auth.getSession();
-    if (!session) {
-      throw new Error("User is not authenticated. Cannot call the secure proxy.");
-    }
+    while(attempt < maxRetries) {
+        try {
+            if (!supabaseUrl) {
+                throw new Error("Supabase URL is not configured. Cannot contact the proxy Edge Function.");
+            }
+            const proxyEndpoint = `${supabaseUrl}/functions/v1/proxy-llm`;
 
-    const body: any = {
-      provider: 'gemini',
-      model: this.model,
-      prompt: prompt,
-      responseMimeType: responseMimeType
-    };
-    if (tools) {
-      body.tools = tools;
-    }
+            const { data: { session } } = await this.supabase.auth.getSession();
+            if (!session) {
+                throw new Error("User is not authenticated. Cannot call the secure proxy.");
+            }
 
-    const response = await fetch(proxyEndpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${session.access_token}`,
-      },
-      body: JSON.stringify(body),
-    });
+            const body: any = {
+                provider: 'gemini',
+                model: this.model,
+                prompt: prompt,
+                responseMimeType: responseMimeType
+            };
+            if (tools) {
+                body.tools = tools;
+            }
 
-    const responseText = await response.text();
-    if (!response.ok) {
-      throw new Error(`Proxy API call for Gemini failed with status ${response.status}: ${responseText}`);
-    }
+            const response = await fetch(proxyEndpoint, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${session.access_token}`,
+                },
+                body: JSON.stringify(body),
+            });
 
-    try {
-      return JSON.parse(responseText);
-    } catch (e) {
-      throw new Error(`Failed to parse JSON response from proxy. Response: ${responseText}`);
+            const responseText = await response.text();
+            if (!response.ok) {
+                 // Create a retryable error for specific server statuses
+                if (response.status === 503 || response.status === 429) {
+                    throw new Error(`RetryableError: Proxy API call for Gemini failed with status ${response.status}: ${responseText}`);
+                }
+                // For other errors, fail immediately
+                throw new Error(`Proxy API call for Gemini failed with status ${response.status}: ${responseText}`);
+            }
+
+            try {
+                return JSON.parse(responseText);
+            } catch (e) {
+                throw new Error(`Failed to parse JSON response from proxy. Response: ${responseText}`);
+            }
+        } catch (error: any) {
+            attempt++;
+             // Check if it's a retryable error and we haven't exceeded attempts
+            if (error.message.startsWith('RetryableError') && attempt < maxRetries) {
+                console.warn(`Attempt ${attempt} for Gemini failed. Retrying in ${delay / 1000}s... Error: ${error.message}`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                delay *= 2; // Exponential backoff
+            } else {
+                 // Not a retryable error or max retries exceeded, throw to fail the process
+                throw error;
+            }
+        }
     }
+    // This should not be reached, but is a fallback
+    throw new Error("Exceeded max retries for Gemini API call.");
   }
 
   async findBestMatchBatch(

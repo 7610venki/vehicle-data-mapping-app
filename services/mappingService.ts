@@ -3,6 +3,7 @@
 
 
 
+
 import {
   ShoryRecord,
   ICRecord,
@@ -44,6 +45,8 @@ interface BestFuzzyCandidate {
   score: number;
   internalId: string;
 }
+
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 const chunk = <T>(arr: T[], size: number): T[][] =>
   Array.from({ length: Math.ceil(arr.length / size) }, (_, i) =>
@@ -127,6 +130,7 @@ export class MappingService {
   ): Promise<MappedRecord[]> {
     const totalRecords = shoryRecords.length;
     let recordsProcessedCount = 0;
+    const INTER_BATCH_DELAY_MS = 500; // Polite delay between AI batches
 
     const processedIcRecords: ICRecord[] = icRecords.map(record => {
       const icMake = normalizeText(record[icConfig.make] as string | number);
@@ -355,6 +359,7 @@ export class MappingService {
                     onProgressUpdate(finalResults[recordIndex], recordsProcessedCount - 1, totalRecords);
                 }
             }
+            if (semanticBatches.length > 1) await delay(INTER_BATCH_DELAY_MS);
         }
 
         const allWebSearchTasks = [...webSearchTasks, ...semanticFailuresToRetry];
@@ -402,6 +407,7 @@ export class MappingService {
                     onProgressUpdate(finalResults[recordIndex], recordsProcessedCount-1, totalRecords);
                 }
             }
+            if (webSearchBatches.length > 1) await delay(INTER_BATCH_DELAY_MS);
         }
     }
 

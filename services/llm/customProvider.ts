@@ -27,41 +27,66 @@ export class CustomProvider implements LlmProvider {
   }
   
   private async makeApiCall(prompt: string): Promise<any> {
-    if (!supabaseUrl) {
-      throw new Error("Supabase URL is not configured. Cannot contact the proxy Edge Function.");
-    }
-    const proxyEndpoint = `${supabaseUrl}/functions/v1/proxy-llm`;
+    const maxRetries = 3;
+    let attempt = 0;
+    let delay = 1000; // start with 1 second
 
-    const { data: { session } } = await this.supabase.auth.getSession();
-    if (!session) {
-        throw new Error("User is not authenticated. Cannot call the secure proxy.");
-    }
-    
-    const response = await fetch(proxyEndpoint, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${session.access_token}`,
-            'X-Provider-Api-Key': this.apiKey,
-        },
-        body: JSON.stringify({
-            provider: 'custom', // Crucial fix: Identify the provider to the proxy
-            model: this.model,
-            prompt: prompt
-        }),
-    });
+    while(attempt < maxRetries) {
+        try {
+            if (!supabaseUrl) {
+                throw new Error("Supabase URL is not configured. Cannot contact the proxy Edge Function.");
+            }
+            const proxyEndpoint = `${supabaseUrl}/functions/v1/proxy-llm`;
 
-    const responseBody = await response.text();
-    if (!response.ok) {
-        throw new Error(`Proxy API call for Custom Provider failed with status ${response.status}: ${responseBody}`);
-    }
+            const { data: { session } } = await this.supabase.auth.getSession();
+            if (!session) {
+                throw new Error("User is not authenticated. Cannot call the secure proxy.");
+            }
+            
+            const response = await fetch(proxyEndpoint, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${session.access_token}`,
+                    'X-Provider-Api-Key': this.apiKey,
+                },
+                body: JSON.stringify({
+                    provider: 'custom',
+                    model: this.model,
+                    prompt: prompt
+                }),
+            });
 
-    try {
-        // The Custom provider proxy returns the JSON text directly in the body
-        return JSON.parse(responseBody);
-    } catch (e) {
-        throw new Error(`Failed to parse JSON response from proxy. Response: ${responseBody}`);
+            const responseBody = await response.text();
+            if (!response.ok) {
+                // Create a retryable error for specific server statuses
+                if (response.status === 503 || response.status === 429) {
+                    throw new Error(`RetryableError: Proxy API call for Custom Provider failed with status ${response.status}: ${responseBody}`);
+                }
+                // For other errors, fail immediately
+                throw new Error(`Proxy API call for Custom Provider failed with status ${response.status}: ${responseBody}`);
+            }
+
+            try {
+                return JSON.parse(responseBody);
+            } catch (e) {
+                throw new Error(`Failed to parse JSON response from proxy. Response: ${responseBody}`);
+            }
+        } catch (error: any) {
+            attempt++;
+            // Check if it's a retryable error and we haven't exceeded attempts
+            if (error.message.startsWith('RetryableError') && attempt < maxRetries) {
+                console.warn(`Attempt ${attempt} for Custom Provider failed. Retrying in ${delay / 1000}s... Error: ${error.message}`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                delay *= 2; // Exponential backoff
+            } else {
+                // Not a retryable error or max retries exceeded, throw to fail the process
+                throw error;
+            }
+        }
     }
+    // This should not be reached, but is a fallback
+    throw new Error("Exceeded max retries for Custom Provider API call.");
   }
   
   async findBestMatchBatch(
