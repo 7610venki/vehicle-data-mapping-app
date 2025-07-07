@@ -25,9 +25,9 @@ This app doesn't just use one method to find matches; it uses a sophisticated, f
 
 #### Layer 2: AI-Generated Rules (Fast)
 
-*   **What it is:** A set of general matching rules that the AI has automatically created by observing patterns in past matches.
-*   **How it works:** It applies rules like, "If `make` is `mercedes` and `model` contains `benz`, set `make` to `Mercedes-Benz`."
-*   **Benefit:** Catches common variations that aren't yet in the knowledge base, providing another layer of high-speed matching.
+*   **What it is:** A set of general matching rules that the AI has automatically and safely created by observing patterns in past matches.
+*   **How it works:** The system applies rules like, "If `make` is `merc`, set `make` to `Mercedes-Benz`." The rule generation process is now much stricter, with automated validation to prevent bad rules from being learned.
+*   **Benefit:** Catches common variations that aren't yet in the knowledge base, providing another layer of high-speed, reliable matching.
 
 #### Layer 3: Fuzzy Matching (For Typos)
 
@@ -44,7 +44,7 @@ For the most difficult cases that remain, the app uses the Google Gemini AI mode
 
 ### The Learning Loop
 
-The most powerful feature is that the system learns. High-confidence matches made by the Fuzzy and AI layers are used to anonymously update the global **Knowledge Base** and generate new **Rules**. This creates a powerful feedback loop where the application becomes faster, more accurate, and more intelligent with every session run by every user.
+The most powerful feature is that the system learns. High-confidence matches made by the Fuzzy and AI layers are used to anonymously update the global **Knowledge Base** and generate new, **validated Rules**. This creates a powerful feedback loop where the application becomes faster, more accurate, and more intelligent with every session run by every user.
 
 ## How to Use It: A Quick Guide
 
@@ -77,7 +77,7 @@ Once the process is complete, you'll see a detailed results table showing how ea
 **Q: What do the different "Match Status" types mean?**
 **A:** They show which technology layer made the match:
 - **Matched (Knowledge):** The best kind of match. It was found instantly using a high-confidence mapping learned from a previous session.
-- **Matched (Learned Rule):** A fast match made by a general rule the AI created (e.g., always map "Merc" to "Mercedes-Benz").
+- **Matched (Learned Rule):** A fast match made by a safe, validated rule the AI created (e.g., always map "Merc" to "Mercedes-Benz").
 - **Matched (Fuzzy):** A good match found by correcting a minor typo.
 - **Matched (AI):** An advanced match made by the AI's deep understanding of the vehicle names, often using web search.
 
@@ -91,21 +91,36 @@ Once the process is complete, you'll see a detailed results table showing how ea
 
 ## For Developers
 
-### Run and deploy your AI Studio app
+### Setup & Run Locally
 
-This contains everything you need to run your app locally.
+**Prerequisites:** Node.js, Supabase account
 
-### Run Locally
-
-**Prerequisites:** Node.js
-
-1.  Install dependencies:
+1.  **Clone the repository.**
+2.  **Install dependencies:**
     `npm install`
-2.  Run the app:
+3.  **Configure Supabase Backend:**
+    *   The application uses Supabase for authentication, session storage, and as a secure proxy for AI calls. You will need to set up the database schema and Edge Functions. Please refer to the SQL setup file and Edge Function code (`proxy-llm-function.ts`) in the repository.
+4.  **Configure Environment Variables:**
+    *   All API keys and secrets are managed as environment variables in Supabase, not in the frontend code.
+    *   Navigate to your Supabase Project dashboard -> Edge Functions -> `proxy-llm`.
+    *   Go to the function's "Secrets" section.
+    *   Add the following secrets. These are essential for the application to work.
+        *   `GEMINI_API_KEYS`: A comma-separated list of your Google Gemini API keys. The function will rotate through them.
+        *   `SUPABASE_URL`: Your Supabase project URL. Found in Project Settings -> API.
+        *   **`SUPABASE_SERVICE_ROLE_KEY`**: Your Supabase `service_role` key. Found in Project Settings -> API. **CRITICAL: This key bypasses all RLS policies and must be kept secret.** It is required for the application to update the global knowledge base.
+5.  **Run the local development server:**
     `npm run dev`
-
-**Note:** For local development, the AI providers (Gemini, Groq) are called via a Supabase Edge Function (`proxy-llm`). You must configure your API keys in the environment variables for that function. See the Supabase documentation for how to set secrets for local Edge Function development.
 
 ### Deploying
 
-See instructions for deploying to a service like Vercel or Netlify. You will need to set your Supabase URL, Anon Key, and your AI provider API keys as environment variables in your hosting provider's project settings.
+This application is designed to be deployed to a static hosting provider like Vercel or Netlify.
+
+1.  **Connect your Git repository** to your hosting provider.
+2.  **Configure Build Settings:**
+    *   Build Command: `npm run build` or `vite build`
+    *   Publish Directory: `dist`
+3.  **Set Environment Variables:**
+    *   In your hosting provider's project settings, add the following environment variables. **They must be prefixed with `VITE_` to be exposed to the client-side application.**
+        *   `VITE_SUPABASE_URL`: Your Supabase project URL.
+        *   `VITE_SUPABASE_ANON_KEY`: Your Supabase public `anon` key.
+    *   **Do not** expose your `GEMINI_API_KEYS` or `SUPABASE_SERVICE_ROLE_KEY` here. They must only live in the secure secrets manager for your Supabase Edge Function.

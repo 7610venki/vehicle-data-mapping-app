@@ -1,6 +1,7 @@
 
+
 import { MappingSession, LearnedRule, LlmConfig, ProgressCallback, KnowledgeBaseEntry } from '../types';
-import { supabase } from './supabaseClient';
+import { supabase, supabaseUrl } from './supabaseClient';
 import { sha256 } from 'js-sha256';
 import { FUZZY_THRESHOLD_DEFAULT, KNOWLEDGE_BASE_IMPORT_BATCH_SIZE } from '../constants';
 
@@ -224,9 +225,9 @@ export class SessionService {
     }
   }
 
-  // Adds entries to the GLOBAL knowledge base.
+  // Adds entries to the GLOBAL knowledge base via a secure Edge Function to bypass RLS.
   async bulkAddToKnowledgeBase(newEntries: Map<string, KnowledgeBaseEntry[]>, onProgress?: ProgressCallback): Promise<void> {
-    if (!supabase || newEntries.size === 0) return;
+    if (!supabase || !supabaseUrl || newEntries.size === 0) return;
     
     const entriesToUpsert = Array.from(newEntries.entries()).flatMap(([key, values]) => 
         values.map(value => ({
@@ -244,19 +245,35 @@ export class SessionService {
 
     for (const [index, batch] of entryChunks.entries()) {
       try {
-        // The onConflict constraint prevents inserting the exact same mapping twice globally.
-        const { error } = await supabase
-          .from('knowledge_base')
-          .upsert(batch, { onConflict: 'shory_normalized_key,ic_make_normalized,ic_model_normalized' });
-        
-        if (error) throw error;
+        const proxyEndpoint = `${supabaseUrl}/functions/v1/proxy-llm`;
+        const { data: { session } } = await supabase.auth.getSession();
+        if (!session) {
+            throw new Error("User must be authenticated to update the knowledge base.");
+        }
+
+        const response = await fetch(proxyEndpoint, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${session.access_token}`,
+            },
+            body: JSON.stringify({
+                provider: 'knowledge-base-update',
+                entries: batch,
+            }),
+        });
+
+        if (!response.ok) {
+            const errorBody = await response.json().catch(() => ({error: 'Could not parse error response.'}));
+            throw new Error(errorBody.error || `Knowledge base update failed with status ${response.status}`);
+        }
 
         processedCount += batch.length;
         onProgress?.(processedCount, totalCount, `Importing... (${index + 1}/${entryChunks.length})`);
 
       } catch (err: any) {
-        console.error(`Error saving knowledge base chunk ${index + 1}:`, err.message ? `${err.message} (Details: ${err.details})` : JSON.stringify(err));
-        throw new Error(`Failed to save a batch of knowledge entries: ${err.message}. Ensure the unique constraint 'knowledge_base_global_mapping_unique' exists.`);
+        console.error(`Error saving knowledge base chunk ${index + 1}:`, err.message);
+        throw new Error(`Failed to save a batch of knowledge entries via proxy: ${err.message}.`);
       }
     }
     onProgress?.(totalCount, totalCount, "Import complete.");
@@ -287,7 +304,7 @@ export class SessionService {
 
       const rulesToUpsert = rules.map(rule => ({
           rule_json: rule,
-          rule_hash: sha256(JSON.stringify(rule)), // Create a hash to prevent duplicates
+          rule_hash: sha256(JSON.stringify({c: rule.conditions, a: rule.actions})), // Hash only the logic part to prevent duplicates
       }));
 
       try {

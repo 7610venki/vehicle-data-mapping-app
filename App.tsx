@@ -1,6 +1,7 @@
 
 
-import React, { useState, useEffect, useCallback, useReducer } from 'react';
+
+import React, { useState, useEffect, useCallback, useReducer, useRef } from 'react';
 import { Session } from '@supabase/supabase-js';
 import {
   ShoryRecord,
@@ -16,6 +17,7 @@ import {
   LlmProvider,
   ProgressCallback,
   KnowledgeBaseEntry,
+  MatchStatus,
 } from './types';
 import { APP_TITLE, STEPS_CONFIG, FUZZY_THRESHOLD_DEFAULT, GEMINI_MODEL_TEXT, CUSTOM_LLM_DEFAULT_MODEL, GITHUB_REPO_URL } from './constants';
 import { supabase } from './services/supabaseClient';
@@ -28,7 +30,8 @@ import SessionManager from './components/SessionManager';
 import Auth from './components/Auth';
 import ActionButton from './components/ActionButton';
 import { parseFile } from './services/fileParserService';
-import { MappingService, downloadCSV } from './services/mappingService';
+import { MappingService } from './services/mappingService';
+import { downloadCSV } from './services/csvExporter';
 import { SessionService } from './services/sessionService';
 import { GeminiProvider } from './services/llm/geminiProvider';
 import { CustomProvider } from './services/llm/customProvider';
@@ -42,6 +45,8 @@ import {
     ArrowRightIcon, DownloadIcon, SettingsIcon, RestartIcon, SaveIcon, LogOutIcon, CpuIcon, DatabaseZapIcon, HelpCircleIcon,
 } from './components/Icons'; 
 import { FileUp, FilePlus2, ListChecks, Settings2, Table2 } from 'lucide-react';
+import { findErrorDetails } from './services/apiErrorData';
+import ApiErrorDialog from './components/ApiErrorDialog';
 
 // --- State Management using useReducer ---
 type AppState = {
@@ -97,7 +102,7 @@ const AppCore = () => {
   const [icFile, setIcFile] = useState<FileData | null>(null);
 
   const [shoryConfig, setShoryConfig] = useState<ShoryColumnConfig>({ make: '', model: '', outputColumns: [] });
-  const [icConfig, setIcConfig] = useState<ICColumnConfig>({ make: '', model: '', codes: [] }); 
+  const [icConfig, setIcConfig] = useState<ICColumnConfig>({ make: '', model: '', codes: [] });
   
   const [fuzzyThreshold, setFuzzyThreshold] = useState<number>(FUZZY_THRESHOLD_DEFAULT);
   const [mappedData, setMappedData] = useState<MappedRecord[]>([]);
@@ -126,6 +131,48 @@ const AppCore = () => {
   const [useLearnedRulesLayer, setUseLearnedRulesLayer] = useState<boolean>(true);
   const [useFuzzyLayer, setUseFuzzyLayer] = useState<boolean>(true);
   const [useAdvancedAiLayer, setUseAdvancedAiLayer] = useState<boolean>(true);
+
+  // --- Performance Optimization for High-Frequency Updates & Background Stability ---
+  // These refs hold the "live" data model updated by the background process.
+  const processingDataRef = useRef<{ data: MappedRecord[], needsUpdate: boolean }>({ data: [], needsUpdate: false });
+  const progressRef = useRef<AppState['progress'] | null>(null);
+  const isProcessingRef = useRef(false);
+
+  useEffect(() => {
+      let animationFrameId: number;
+
+      // This function runs on every animation frame when the tab is active.
+      const syncUiWithDataModel = () => {
+          if (!isProcessingRef.current) return; // Stop the loop if processing is finished.
+
+          // Sync the progress bar state if there's a new update.
+          if (progressRef.current) {
+              dispatch({ type: 'SET_PROGRESS', payload: progressRef.current });
+              progressRef.current = null;
+          }
+
+          // Sync the table data state if there's a new update.
+          // This is the key: we only update state when the background process signals that it has changed the data.
+          if (processingDataRef.current.needsUpdate) {
+              setMappedData([...processingDataRef.current.data]); // Update React state with a copy of the live data
+              processingDataRef.current.needsUpdate = false; // Reset the flag
+          }
+
+          // Continue the loop for the next frame.
+          animationFrameId = requestAnimationFrame(syncUiWithDataModel);
+      };
+
+      // Start the loop only when processing is active.
+      if (isProcessingRef.current) {
+          animationFrameId = requestAnimationFrame(syncUiWithDataModel);
+      }
+
+      // Cleanup function to cancel the loop when the component unmounts or processing stops.
+      return () => {
+          cancelAnimationFrame(animationFrameId);
+      };
+  }, [isProcessingRef.current]); // This effect re-runs only when processing starts or stops.
+  // --- End Performance Optimization ---
 
   useEffect(() => {
     const savedApiKey = sessionStorage.getItem('customLlmApiKey');
@@ -188,6 +235,13 @@ const AppCore = () => {
   }, [session, sessionServiceInstance]);
 
   useEffect(() => {
+    // If a mapping process is running in the background, we must not interrupt its UI state
+    // by re-fetching sessions. A token refresh might trigger this effect, but the UI
+    // should remain focused on the mapping progress.
+    if (isProcessingRef.current) {
+      return;
+    }
+
     if (session && sessionServiceInstance) {
         dispatch({ type: 'START_LOADING', payload: { message: "Loading sessions..." } });
         Promise.all([
@@ -195,7 +249,11 @@ const AppCore = () => {
           fetchKnowledgeBaseCount()
         ]).then(([savedSessions]) => {
             setSessions(savedSessions);
-            setViewMode(savedSessions.length > 0 ? 'welcome' : 'mapping');
+            // Only set the view mode on initial load. Don't flip back to 'welcome'
+            // if the user is already deep in the mapping flow.
+            if (currentStep <= AppStep.UPLOAD_SHORY) {
+               setViewMode(savedSessions.length > 0 ? 'welcome' : 'mapping');
+            }
         }).catch((err) => {
             dispatch({ type: 'SET_ERROR', payload: `Failed to load sessions: ${err.message}. Please ensure database tables are set up correctly.` });
         }).finally(() => {
@@ -204,7 +262,7 @@ const AppCore = () => {
     } else {
         setViewMode('auth');
     }
-  }, [session, sessionServiceInstance, fetchKnowledgeBaseCount]);
+  }, [session, sessionServiceInstance, fetchKnowledgeBaseCount, currentStep]);
 
   const handleFileUpload = async (file: File, type: 'shory' | 'ic') => {
     dispatch({ type: 'START_LOADING', payload: { message: `Parsing ${file.name}...` } });
@@ -251,9 +309,21 @@ const AppCore = () => {
     }
 
     dispatch({ type: 'START_PROCESS', payload: { message: 'Preparing data for mapping...', total: shoryFile.records.length }});
-    setMappedData([]); 
 
+    // Initialize mappedData with placeholders
     const shoryRecordsWithId: ShoryRecord[] = shoryFile.records.map((r, i) => ({ ...r, __id: `shory-${i}`}));
+    const initialMappedData: MappedRecord[] = shoryRecordsWithId.map(rec => ({
+      ...rec,
+      matchStatus: MatchStatus.NOT_PROCESSED
+    }));
+    setMappedData(initialMappedData); // Initial render with placeholders
+
+    // --- NEW: Reset and start processing loop ---
+    // Set up the live data model in the ref.
+    processingDataRef.current = { data: [...initialMappedData], needsUpdate: false };
+    progressRef.current = null;
+    isProcessingRef.current = true; // This will trigger the useEffect to start the UI polling loop.
+
     const icRecordsWithId: ICRecord[] = icFile.records.map((r, i) => ({ ...r, __id: `ic-${i}`}));
     
     const mappingService = new MappingService(llmProviderInstance);
@@ -268,6 +338,7 @@ const AppCore = () => {
           ]);
         } catch (err: any) {
             dispatch({ type: 'SET_ERROR', payload: `Could not fetch cloud data: ${err.message}`});
+            dispatch({ type: 'STOP_LOADING' }); // Stop loading as the process can't continue
             return;
         }
     }
@@ -277,21 +348,31 @@ const AppCore = () => {
         shoryRecordsWithId, icRecordsWithId, shoryConfig, icConfig, fuzzyThreshold,
         useKnowledgeBaseLayer, useLearnedRulesLayer, useFuzzyLayer, useAdvancedAiLayer, knowledgeBase, learnedRules,
         (processedRecord, currentIndex, total) => { 
-            const recordForState: MappedRecord = { ...processedRecord };
-            setMappedData(prevData => {
-              const existingIndex = prevData.findIndex(item => item.__id === recordForState.__id);
-              if (existingIndex > -1) {
-                const newData = [...prevData];
-                newData[existingIndex] = recordForState;
-                return newData;
-              }
-              return [...prevData, recordForState].sort((a,b) => parseInt(a.__id.split('-')[1]) - parseInt(b.__id.split('-')[1]));
-            });
+            // This callback is now super lightweight and decouples the background process from React state.
 
+            // 1. Find and update the record in our "live" in-memory data model (the ref).
+            const recordIndex = processingDataRef.current.data.findIndex(r => r.__id === processedRecord.__id);
+            if (recordIndex !== -1) {
+                processingDataRef.current.data[recordIndex] = processedRecord;
+            } else {
+                // This case shouldn't happen if IDs are correct, but as a fallback:
+                processingDataRef.current.data.push(processedRecord);
+            }
+            
+            // 2. Signal to the UI polling loop that there's a new update to render.
+            processingDataRef.current.needsUpdate = true;
+            
+            // 3. Update the progress ref.
             const percentage = total > 0 ? ((currentIndex + 1) / total) * 100 : 0;
-            dispatch({type: 'SET_PROGRESS', payload: {current: currentIndex + 1, total: total, message: `Processed ${currentIndex + 1} of ${total} (${percentage.toFixed(0)}%)`}});
+            progressRef.current = {
+                current: currentIndex + 1, 
+                total: total, 
+                message: `Processed ${currentIndex + 1} of ${total} (${percentage.toFixed(0)}%)`
+            };
         }
       );
+      
+      // After mapping is done, set the final, authoritative data from the results array.
       setMappedData(results);
       
       if (session && sessionServiceInstance && llmProviderInstance) {
@@ -307,14 +388,31 @@ const AppCore = () => {
       setCurrentStep(AppStep.SHOW_RESULTS);
     } catch (err: any) {
       const errorMessage = err.message || "An unknown error occurred during mapping.";
-      const userFriendlyMessage = `The mapping process was interrupted due to a service error: "${errorMessage}". You can view the results that were successfully processed before the interruption. The AI service may be temporarily overloaded.`;
+      const specificErrorDetail = findErrorDetails(errorMessage);
       
-      // Dispatch an error that will be displayed as an Alert, but don't halt the flow.
-      dispatch({ type: 'SET_ERROR', payload: userFriendlyMessage });
+      isProcessingRef.current = false;
+      dispatch({ type: 'STOP_LOADING' });
+
+      if (specificErrorDetail) {
+        await alert({
+          title: 'API Error Occurred',
+          message: <ApiErrorDialog errorDetail={specificErrorDetail} />,
+          confirmText: 'Acknowledge',
+        });
+      } else {
+        await alert({
+          title: 'An Unexpected Error Occurred',
+          message: `The mapping process was interrupted, preventing further records from being processed. You can view any partially processed results. Details: ${errorMessage}`,
+          confirmText: 'Acknowledge',
+          variant: 'destructive',
+        });
+      }
       
       // Navigate to the results page to show the partial data
       setCurrentStep(AppStep.SHOW_RESULTS);
     } finally {
+      // --- NEW: Stop the UI polling loop ---
+      isProcessingRef.current = false;
       dispatch({ type: 'STOP_LOADING' });
     }
   };
@@ -615,7 +713,7 @@ const AppCore = () => {
                     <p className="text-xs text-muted-foreground">Layers run sequentially on unmatched records. Enable learning layers to improve accuracy over time.</p>
                     {[
                         {id: "useKnowledgeBaseLayer", label: "Cloud Knowledge Base", checked: useKnowledgeBaseLayer, setter: setUseKnowledgeBaseLayer, disabled: !sessionServiceInstance, note: !sessionServiceInstance ? '(Cloud Service Unavailable)' : `(Fastest, uses shared historical matches from all users. ${knowledgeBaseCount !== null ? knowledgeBaseCount.toLocaleString() : '...'} entries found.)`},
-                        {id: "useLearnedRulesLayer", label: "AI-Generated Rules", checked: useLearnedRulesLayer, setter: setUseLearnedRulesLayer, disabled: !sessionServiceInstance || !llmProviderInstance, note: !sessionServiceInstance || !llmProviderInstance ? '(AI/Cloud Service Unavailable)' : "(Fast, applies shared, auto-generated matching rules)"},
+                        {id: "useLearnedRulesLayer", label: "AI-Generated Rules", checked: useLearnedRulesLayer, setter: setUseLearnedRulesLayer, disabled: !sessionServiceInstance || !llmProviderInstance, note: !sessionServiceInstance || !llmProviderInstance ? '(AI/Cloud Service Unavailable)' : "(Fast, applies shared, validated matching rules)"},
                         {id: "useFuzzyLayer", label: "Fuzzy Matching Layer", checked: useFuzzyLayer, setter: setUseFuzzyLayer, disabled: false, note: "(Fast, local text similarity for typos)"},
                         {id: "useAdvancedAiLayer", label: "Advanced AI Matching Layer", checked: useAdvancedAiLayer, setter: setUseAdvancedAiLayer, disabled: !llmProviderInstance, note: !llmProviderInstance ? '(AI Service Unavailable)' : "AI-powered semantic comparison, with web search for difficult matches (web search is Gemini-only)."},
                     ].map(layer => (

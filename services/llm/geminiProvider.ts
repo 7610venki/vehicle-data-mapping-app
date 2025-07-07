@@ -1,5 +1,6 @@
 
 
+
 import { SupabaseClient } from "@supabase/supabase-js";
 import { 
     LlmProvider, 
@@ -79,8 +80,12 @@ export class GeminiProvider implements LlmProvider {
     const maxRetries = 3;
     let attempt = 0;
     let delay = 1000; // Start with 1 second
+    const timeoutDuration = 60000; // 60-second timeout for AI calls
 
     while(attempt < maxRetries) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeoutDuration);
+
         try {
             if (!supabaseUrl) {
                 throw new Error("Supabase URL is not configured. Cannot contact the proxy Edge Function.");
@@ -109,7 +114,10 @@ export class GeminiProvider implements LlmProvider {
                     'Authorization': `Bearer ${session.access_token}`,
                 },
                 body: JSON.stringify(body),
+                signal: controller.signal,
             });
+
+            clearTimeout(timeoutId);
 
             const responseText = await response.text();
             if (!response.ok) {
@@ -127,6 +135,12 @@ export class GeminiProvider implements LlmProvider {
                 throw new Error(`Failed to parse JSON response from proxy. Response: ${responseText}`);
             }
         } catch (error: any) {
+            clearTimeout(timeoutId);
+            
+            if (error.name === 'AbortError') {
+                error.message = `RetryableError: Request timed out after ${timeoutDuration / 1000} seconds.`;
+            }
+
             attempt++;
              // Check if it's a retryable error and we haven't exceeded attempts
             if (error.message.startsWith('RetryableError') && attempt < maxRetries) {
@@ -164,7 +178,9 @@ For each Shory vehicle, find the most accurate Make/Model match from the IC list
 Prioritize matching MAKE first, then MODEL. Consider variations, typos, and abbreviations.
 Use web search to enhance your knowledge.
 
-Respond ONLY with a single JSON array, where each object corresponds to a Shory vehicle from the input list. The object must have this exact format:
+**CRITICAL INSTRUCTION: Your ENTIRE output MUST be a single, valid JSON array of objects. NOTHING ELSE. Do not include any text, notes, explanations, or markdown formatting like \`\`\`json. The first character of your response must be '[' and the last must be ']'.**
+
+Each object in the array corresponds to a Shory vehicle from the input list and must have this exact format:
 {
   "shoryId": "THE_ORIGINAL_ID_OF_THE_SHORY_VEHICLE",
   "matchedICMake": "MATCHED_IC_MAKE_OR_NULL",
@@ -173,7 +189,17 @@ Respond ONLY with a single JSON array, where each object corresponds to a Shory 
   "confidence": CONFIDENCE_SCORE_0_TO_1_OR_NULL,
   "reason": "ONE_LINE_EXPLANATION"
 }
-If no confident match is found for a Shory vehicle, set its matched fields to null and confidence to a low value. Provide a reason.
+
+- If no confident match is found, set its matched fields to null and confidence to a low value. Provide a reason.
+- Example of a "No Match" JSON object:
+{
+  "shoryId": "some-shory-id-456",
+  "matchedICMake": null,
+  "matchedICModel": null,
+  "matchedICCode": null,
+  "confidence": 0.1,
+  "reason": "No similar make/model found in the IC list."
+}
 
 Shory Vehicles List to Process:
 ${shoryListString}
@@ -202,19 +228,11 @@ ${icListString}
             }
             });
         }
+        return results;
     } catch (error) {
       console.error("Error calling Gemini API via proxy (Web Search Batch):", error);
-      shoryRecords.forEach(rec => {
-        results.set(rec.id, {
-          shoryId: rec.id,
-          matchedICMake: null, matchedICModel: null, matchedICCode: null, confidence: 0,
-          reason: `Gemini API Error: ${error instanceof Error ? error.message : "Unknown error"}`
-        });
-      });
-      if (error instanceof Error) throw error;
+      throw error;
     }
-
-    return results;
   }
   
   async semanticCompareWithLimitedListBatch(
@@ -241,24 +259,39 @@ ${candidateListString || "No candidates provided."}
 For each task below, you must strictly follow these rules to find the best match for a "Shory" vehicle from its list of "Insurance Company (IC)" candidates.
 
 **Matching Rules:**
-1.  **VALIDATE MAKE:** The MAKE of the Shory vehicle and the IC candidate must be semantically identical or a very common abbreviation (e.g., "Mercedes-Benz" and "Mercedes" is OK). If the MAKES are different brands (e.g., "BYD" vs "AUDI"), it is NOT a match, even if the model name is similar.
-2.  **COMPARE MODEL:** ONLY if the MAKE is a valid match, you then compare the MODEL for the highest semantic similarity.
-3.  **REJECT IF NO MATCH:** If no candidate satisfies BOTH rules, you MUST indicate no match was found. Do not select the "least bad" option.
+1.  **VALIDATE MAKE:** The MAKE of the Shory vehicle and the IC candidate must be semantically identical or a very common abbreviation (e.g., "Mercedes-Benz" and "Mercedes" is OK). If the MAKES are different brands (e.g., "BYD" vs "AUDI"), it is NOT a match.
+2.  **VALIDATE MODEL:** If the MAKE is a valid match, you must strictly validate the MODEL.
+    - **Different numbers are NOT a match.** (e.g., "K4000" vs "K3000"; "300ZX" vs "350Z"; "F360" vs "F430").
+    - **Different body types or suffixes are NOT a match.** (e.g., "Patrol" vs "Patrol Pick Up"; "308" vs "308 SW").
+    - **Different core names are NOT a match.** (e.g., "Charmant" vs "Charade"; "Silver Spur" vs "Silver Spirit").
+3.  **REJECT IF NO MATCH:** If no candidate satisfies ALL rules, you MUST indicate no match was found. Do not select the "least bad" option.
 
 **Example of what NOT to do (Invalid Match):**
-- Shory Vehicle: Make: "BYD", Model: "S6"
-- IC Candidate: Make: "AUDI", Model: "S6"
-- Correct decision: This is NOT a match because the makes (BYD, AUDI) are completely different.
+- Shory Vehicle: Make: "Nissan", Model: "300ZX"
+- IC Candidate: Make: "Nissan", Model: "350Z"
+- Correct decision: This is NOT a match because the model numbers (300 vs 350) are different.
 
 **Response Format:**
-Respond ONLY with a single JSON array, where each object corresponds to a task. The object must have this exact format:
+**CRITICAL: Respond ONLY with a single valid JSON array, without any surrounding text, explanations, or markdown formatting like \`\`\`json. Your entire response must be the JSON array itself.**
+
+Each object in the array corresponds to a task and must have this exact format:
 {
   "shoryId": "THE_ORIGINAL_ID_FROM_THE_TASK",
   "chosenICIndex": INDEX_OF_CHOSEN_IC_VEHICLE_FROM_LIST_OR_NULL,
   "confidence": CONFIDENCE_SCORE_0_TO_1_OR_NULL,
   "reason": "ONE_LINE_EXPLANATION of why the choice was made or rejected based on the rules."
 }
-The chosenICIndex must be the 1-based number from the list for that specific task. If no match, chosenICIndex must be null.
+
+- The \`chosenICIndex\` must be the 1-based number from the list for that specific task.
+- **If no match is found, \`chosenICIndex\` MUST be \`null\` and confidence should be low (e.g., 0.1).**
+
+**Example of a "No Match" JSON object:**
+{
+  "shoryId": "some-shory-id-123",
+  "chosenICIndex": null,
+  "confidence": 0.1,
+  "reason": "No candidate had a matching make and model based on the strict rules."
+}
 
 --- TASKS ---
 ${tasksString}
@@ -288,17 +321,11 @@ ${tasksString}
           }
         });
       }
+      return results;
     } catch (error) {
       console.error("Error calling Gemini API via proxy (Semantic Batch):", error);
-      tasks.forEach(task => {
-        results.set(task.shoryId, {
-          matchedICInternalId: null, confidence: 0,
-          aiReason: `Gemini API Error: ${error instanceof Error ? error.message : "Unknown error"}`
-        });
-      });
-      if (error instanceof Error) throw error;
+      throw error;
     }
-    return results;
   }
 
   async generateRulesFromMatches(examples: RuleGenerationExample[]): Promise<LearnedRule[]> {
@@ -306,40 +333,27 @@ ${tasksString}
     
     const examplesString = examples.map(e => `- Shory (Make: "${e.shoryMake}", Model: "${e.shoryModel}") => IC (Make: "${e.icMake}", Model: "${e.icModel}")`).join('\n');
     
-    const prompt = `You are a data analyst creating a rule-based matching system.
-Based on the provided list of successful vehicle data matches, generate a set of generic, reusable matching rules.
-The rules should be logical and not overly specific to avoid overfitting.
-Focus on common patterns, abbreviations, and tokenizations.
+    const prompt = `You are a data analyst creating a rule-based matching system. Based on the provided list of successful vehicle data matches, generate a set of **safe, high-quality, reusable** matching rules.
 
-RULES:
-- A rule must contain one or more conditions.
-- A condition checks if a 'make' or 'model' field 'contains' or 'equals' a specific lowercase value.
-- Use 'contains' for partial matches and 'equals' for exact matches on normalized text.
-- Create a rule only if you can identify a clear, reusable pattern.
-- The action part of the rule must use the values from the IC (Insurance Company) side of the example.
+**CRITICAL SAFETY RULES FOR RULE GENERATION:**
+1.  **FOCUS ON ABBREVIATIONS & REORDERING ONLY:** Your primary goal is to create rules for common abbreviations (e.g., "merc" -> "mercedes-benz") or reordered words (e.g., "pick up patrol" -> "patrol pickup").
+2.  **DO NOT GENERALIZE ACROSS DIFFERENT MODELS:** You MUST NOT create rules that match different models, even if they seem similar.
+    - **INVALID:** \`300ZX\` vs \`350Z\` (different numbers).
+    - **INVALID:** \`F360\` vs \`F430\` (different numbers).
+    - **INVALID:** \`Charmant\` vs \`Charade\` (different core names).
+3.  **BE CAUTIOUS WITH SUFFIXES:** A rule should not match a base model to a model with a different body type suffix (e.g., matching "308" to "308 SW" is incorrect).
+4.  **CREATE SPECIFIC, NOT GENERAL, RULES:** Conditions should be specific. A rule with a condition like \`"value": "f"\` is too broad and dangerous.
 
-Respond ONLY with a single JSON array of rule objects. Each rule object must have this exact structure:
+**RESPONSE FORMAT:**
+**CRITICAL: Respond ONLY with a single valid JSON array of rule objects, without any surrounding text, explanations, or markdown formatting like \`\`\`json. Your entire response must be the JSON array itself.**
+
+Each rule object in the array must have this exact structure:
 {
   "conditions": [
     { "field": "make" | "model", "operator": "contains" | "equals", "value": "LOWERCASE_STRING" }
   ],
   "actions": { "setMake": "IC_MAKE_VALUE", "setModel": "IC_MODEL_VALUE" }
 }
-
-Example Input:
-- Shory (Make: "Toyota", Model: "Camry LE") => IC (Make: "TOYOTA", Model: "CAMRY 4D SDN LE")
-
-Example JSON output for the above:
-[
-  {
-    "conditions": [
-      { "field": "make", "operator": "equals", "value": "toyota" },
-      { "field": "model", "operator": "contains", "value": "camry" },
-      { "field": "model", "operator": "contains", "value": "le" }
-    ],
-    "actions": { "setMake": "TOYOTA", "setModel": "CAMRY 4D SDN LE" }
-  }
-]
 
 Here are the successful matches to analyze:
 ${examplesString}
@@ -349,15 +363,17 @@ ${examplesString}
       const parsedArray = this.parseJsonArrayResponse(response.text);
 
       if (Array.isArray(parsedArray)) {
+        // Basic validation on the returned rules
         return parsedArray.filter(rule => 
-            rule && Array.isArray(rule.conditions) && rule.actions && rule.actions.setMake && rule.actions.setModel
+            rule && Array.isArray(rule.conditions) && rule.conditions.length > 0 &&
+            rule.actions && rule.actions.setMake && rule.actions.setModel &&
+            rule.conditions.every((c:any) => c.field && c.operator && typeof c.value === 'string' && c.value.length > 0)
         ) as LearnedRule[];
       }
       return [];
 
     } catch(error) {
       console.error("Error calling Gemini API via proxy (Rule Generation):", error);
-      if (error instanceof Error) throw error;
       return [];
     }
   }

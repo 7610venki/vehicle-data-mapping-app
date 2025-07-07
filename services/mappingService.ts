@@ -1,9 +1,5 @@
 
 
-
-
-
-
 import {
   ShoryRecord,
   ICRecord,
@@ -23,6 +19,7 @@ import {
   AI_WEB_SEARCH_BATCH_SIZE,
   KNOWLEDGE_BASE_CONFIDENCE_THRESHOLD,
   FUZZY_MAKE_SIMILARITY_THRESHOLD,
+  MAX_IC_RECORDS_FOR_AI_PROMPT,
 } from '../constants';
 import { SessionService } from './sessionService';
 import { normalizeText, extractBaseModel } from './normalizationService';
@@ -47,6 +44,9 @@ interface BestFuzzyCandidate {
 }
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Increased delay to avoid API rate limiting errors (e.g., 60 RPM on free tiers means 1 req/sec).
+const INTER_BATCH_DELAY_MS = 1100; // Polite delay between AI batches
 
 const chunk = <T>(arr: T[], size: number): T[][] =>
   Array.from({ length: Math.ceil(arr.length / size) }, (_, i) =>
@@ -130,7 +130,6 @@ export class MappingService {
   ): Promise<MappedRecord[]> {
     const totalRecords = shoryRecords.length;
     let recordsProcessedCount = 0;
-    const INTER_BATCH_DELAY_MS = 500; // Polite delay between AI batches
 
     const processedIcRecords: ICRecord[] = icRecords.map(record => {
       const icMake = normalizeText(record[icConfig.make] as string | number);
@@ -161,6 +160,23 @@ export class MappingService {
     const findRecordIndexById = (id: string) => finalResults.findIndex(rec => rec.__id === id);
 
     let recordsToProcessIds = new Set(shoryRecords.map(r => r.__id));
+
+    // Layer -1: Pre-flight data validation
+    const invalidPlaceholders = new Set(['', 'null', 'na', 'n/a', '-', 'none']);
+    for (const shoryRecord of finalResults) {
+        if (!recordsToProcessIds.has(shoryRecord.__id)) continue;
+
+        const isMakeInvalid = !shoryRecord.__shoryMake || invalidPlaceholders.has(shoryRecord.__shoryMake);
+        const isModelInvalid = !shoryRecord.__shoryModel || invalidPlaceholders.has(shoryRecord.__shoryModel);
+
+        if (isMakeInvalid || isModelInvalid) {
+            shoryRecord.matchStatus = MatchStatus.NO_MATCH;
+            shoryRecord.aiReason = `Record could not be processed due to missing or invalid Make/Model. Found Make: '${shoryRecord[shoryConfig.make]}', Model: '${shoryRecord[shoryConfig.model]}'.`;
+            recordsToProcessIds.delete(shoryRecord.__id);
+            recordsProcessedCount++;
+            if (onProgressUpdate) onProgressUpdate(shoryRecord, recordsProcessedCount - 1, totalRecords);
+        }
+    }
 
     // Layer 0: Knowledge Base
     if (useKnowledgeBaseLayer && knowledgeBase.size > 0) {
@@ -317,13 +333,13 @@ export class MappingService {
         
         const semanticFailuresToRetry: MappedRecord[] = [];
         const semanticBatches = chunk(semanticTasks, SEMANTIC_LLM_BATCH_SIZE);
-        for (const batch of semanticBatches) {
+        for (const [index, batch] of semanticBatches.entries()) {
             batch.forEach(task => {
                 const recordIndex = findRecordIndexById(task.shoryId);
                 if (recordIndex > -1) {
                     finalResults[recordIndex].matchStatus = MatchStatus.PROCESSING_SEMANTIC_LLM;
                     finalResults[recordIndex].aiReason = "AI semantic processing...";
-                    if (onProgressUpdate) onProgressUpdate(finalResults[recordIndex], recordsProcessedCount + semanticTasks.indexOf(task), totalRecords);
+                    if (onProgressUpdate) onProgressUpdate(finalResults[recordIndex], recordsProcessedCount - 1, totalRecords);
                 }
             });
 
@@ -342,37 +358,53 @@ export class MappingService {
                         finalResults[recordIndex].matchedICCodes = chosenICRecord.__icCodes;
                         finalResults[recordIndex].matchStatus = MatchStatus.MATCHED_SEMANTIC_LLM;
                         finalResults[recordIndex].matchConfidence = result.confidence !== null ? parseFloat(result.confidence.toFixed(2)) : undefined;
+                        
+                        // Record is finalized.
                         recordsToProcessIds.delete(shoryId);
+                        recordsProcessedCount++;
+                        if (onProgressUpdate) onProgressUpdate(finalResults[recordIndex], recordsProcessedCount - 1, totalRecords);
+
                     } else {
                          finalResults[recordIndex].matchStatus = MatchStatus.ERROR_AI;
                          finalResults[recordIndex].aiReason = "Semantic AI chose an ID not found. " + (result.aiReason || "");
+                         
+                         // Record is finalized (with error).
+                         recordsToProcessIds.delete(shoryId);
+                         recordsProcessedCount++;
+                         if (onProgressUpdate) onProgressUpdate(finalResults[recordIndex], recordsProcessedCount - 1, totalRecords);
                     }
                 } else {
-                    // --- NEW: Second Chance Logic ---
-                    // This failed semantic match should be retried with web search.
+                    // This is not a final state. Escalate to web search. DO NOT count progress.
                     semanticFailuresToRetry.push(finalResults[recordIndex]);
                     finalResults[recordIndex].aiReason = "Semantic AI found no match; escalating to web search. " + (result.aiReason || "");
-                }
-
-                if (onProgressUpdate) {
-                    recordsProcessedCount++;
-                    onProgressUpdate(finalResults[recordIndex], recordsProcessedCount - 1, totalRecords);
+                    if (onProgressUpdate) onProgressUpdate(finalResults[recordIndex], recordsProcessedCount - 1, totalRecords);
                 }
             }
-            if (semanticBatches.length > 1) await delay(INTER_BATCH_DELAY_MS);
+            if (index < semanticBatches.length - 1) { // Don't wait after the last batch
+                await delay(INTER_BATCH_DELAY_MS);
+            }
         }
 
         const allWebSearchTasks = [...webSearchTasks, ...semanticFailuresToRetry];
         const webSearchBatches = chunk(allWebSearchTasks, AI_WEB_SEARCH_BATCH_SIZE);
-        for (const batch of webSearchBatches) {
+        for (const [index, batch] of webSearchBatches.entries()) {
              batch.forEach(rec => {
-                rec.matchStatus = MatchStatus.PROCESSING_AI;
-                rec.aiReason = "AI (web search) processing...";
-                if(onProgressUpdate) onProgressUpdate(rec, recordsProcessedCount + batch.indexOf(rec), totalRecords);
+                const recordIndex = findRecordIndexById(rec.__id);
+                if (recordIndex > -1) {
+                    finalResults[recordIndex].matchStatus = MatchStatus.PROCESSING_AI;
+                    finalResults[recordIndex].aiReason = "AI (web search) processing...";
+                    if (onProgressUpdate) onProgressUpdate(finalResults[recordIndex], recordsProcessedCount - 1, totalRecords);
+                }
             });
             const uniqueMakesInBatch = [...new Set(batch.map(r => r.__shoryMake).filter((m): m is string => !!m))];
             const relevantIcRecords = processedIcRecords.filter(icRec => uniqueMakesInBatch.includes(icRec.__icMake!));
-            const icListForPrompt = relevantIcRecords.length > 0 ? relevantIcRecords : processedIcRecords;
+            let icListForPrompt = relevantIcRecords.length > 0 ? relevantIcRecords : processedIcRecords;
+
+            let contextWasLimited = false;
+            if (icListForPrompt.length > MAX_IC_RECORDS_FOR_AI_PROMPT) {
+                icListForPrompt = icListForPrompt.slice(0, MAX_IC_RECORDS_FOR_AI_PROMPT);
+                contextWasLimited = true;
+            }
 
             const batchResults = await this.llmProvider.findBestMatchBatch(
                 batch.map(r => ({ id: r.__id, make: r[shoryConfig.make] as string, model: r[shoryConfig.model] as string })),
@@ -383,10 +415,21 @@ export class MappingService {
                 const recordIndex = findRecordIndexById(shoryId);
                 if (recordIndex === -1) continue;
                 
-                finalResults[recordIndex].aiReason = result.reason;
+                let finalReason = result.reason;
+                if (contextWasLimited) {
+                    finalReason += ` (Note: Context limited to the first ${MAX_IC_RECORDS_FOR_AI_PROMPT} potential IC matches to prevent timeouts.)`;
+                }
+                finalResults[recordIndex].aiReason = finalReason;
+                
                 if (result.groundingSources) {
                     finalResults[recordIndex].groundingSources = result.groundingSources;
                 }
+                
+                // This is the final AI layer. The record is considered "processed" here.
+                // We will finalize its state now.
+                recordsToProcessIds.delete(shoryId);
+                recordsProcessedCount++;
+
                 if (result.matchedICMake && result.matchedICModel && (result.confidence === null || result.confidence >= 0.5)) {
                     const originalIC = icRecordsByOriginal.get(`${result.matchedICMake}|${result.matchedICModel}`);
                     if(originalIC){
@@ -400,14 +443,15 @@ export class MappingService {
                     }
                     finalResults[recordIndex].matchStatus = MatchStatus.MATCHED_AI;
                     finalResults[recordIndex].matchConfidence = result.confidence !== null ? parseFloat(result.confidence.toFixed(2)) : undefined;
-                    recordsToProcessIds.delete(shoryId);
+                } else {
+                    // If no match from the AI, it's a definitive No Match.
+                    finalResults[recordIndex].matchStatus = MatchStatus.NO_MATCH;
                 }
-                if (onProgressUpdate) {
-                    recordsProcessedCount++;
-                    onProgressUpdate(finalResults[recordIndex], recordsProcessedCount-1, totalRecords);
-                }
+                if (onProgressUpdate) onProgressUpdate(finalResults[recordIndex], recordsProcessedCount -1, totalRecords);
             }
-            if (webSearchBatches.length > 1) await delay(INTER_BATCH_DELAY_MS);
+            if (index < webSearchBatches.length - 1) { // Don't wait after the last batch
+                await delay(INTER_BATCH_DELAY_MS);
+            }
         }
     }
 
@@ -425,14 +469,68 @@ export class MappingService {
             if(useAdvancedAiLayer) enabledLayers.push("Advanced AI");
             rec.aiReason = `No match found by enabled layers: ${enabledLayers.join(', ') || 'None'}.`;
         }
-        if (onProgressUpdate && recordsProcessedCount < totalRecords) {
+        // This is the final step for these records. Count them now.
+        if (recordsProcessedCount < totalRecords) {
           recordsProcessedCount++;
-          onProgressUpdate(rec, recordsProcessedCount - 1, totalRecords);
+          if (onProgressUpdate) onProgressUpdate(rec, recordsProcessedCount - 1, totalRecords);
         }
       }
     });
 
     return finalResults;
+  }
+  
+  private validateAndFilterGeneratedRules(
+    rules: LearnedRule[],
+    examples: RuleGenerationExample[]
+  ): LearnedRule[] {
+    const MIN_CONDITION_VALUE_LENGTH = 2;
+    const MODEL_SIMILARITY_THRESHOLD = 0.7; // Stricter threshold for rule safety
+  
+    const fuzzyMatcher = new Fuse([], { keys: ['model'], includeScore: true });
+  
+    return rules.filter(rule => {
+      // 1. Basic Sanity Check
+      if (!rule.conditions || rule.conditions.length === 0 || !rule.actions) {
+        return false;
+      }
+  
+      // 2. Prevent Overly Generic Rules
+      const isTooGeneric = rule.conditions.some(
+        c => c.value.length < MIN_CONDITION_VALUE_LENGTH
+      );
+      if (isTooGeneric) {
+        return false;
+      }
+  
+      // 3. Model Similarity Check (The most important check)
+      // Find the original example that likely spawned this rule
+      const potentialExample = examples.find(
+        ex =>
+          ex.icMake === rule.actions.setMake &&
+          ex.icModel === rule.actions.setModel
+      );
+  
+      if (potentialExample) {
+        // Compare the IC model (action) with the Shory model (from the example)
+        fuzzyMatcher.setCollection([
+          { model: normalizeText(potentialExample.shoryModel) },
+        ]);
+        const results = fuzzyMatcher.search(normalizeText(rule.actions.setModel));
+  
+        if (results.length > 0) {
+          const score = 1 - results[0].score; // 1 is a perfect match
+          // If the score is below the threshold, the models are too different (e.g., F360 vs F430)
+          if (score < MODEL_SIMILARITY_THRESHOLD) {
+            console.warn(`[Rule Validation] Discarding unsafe rule: Models "${potentialExample.shoryModel}" and "${rule.actions.setModel}" are too dissimilar.`, rule);
+            return false;
+          }
+        }
+      }
+  
+      // If all checks pass, the rule is considered safe
+      return true;
+    });
   }
   
   public async performLearning(
@@ -488,69 +586,13 @@ export class MappingService {
               icModel: record.matchedICModel!,
           }));
           
-          const newRules = await llmProvider.generateRulesFromMatches(ruleExamples);
-          if(newRules.length > 0) {
-              await sessionService.saveLearnedRules(newRules);
+          const proposedRules = await llmProvider.generateRulesFromMatches(ruleExamples);
+          const safeRules = this.validateAndFilterGeneratedRules(proposedRules, ruleExamples);
+
+          if(safeRules.length > 0) {
+              console.log(`[Rule Learning] Generated ${proposedRules.length} rules, kept ${safeRules.length} after validation.`);
+              await sessionService.saveLearnedRules(safeRules);
           }
       }
   }
 }
-
-export const downloadCSV = (data: MappedRecord[], shoryConfig: ShoryColumnConfig, icConfig: ICColumnConfig, filename: string = 'mapped_results.csv'): void => {
-  if (data.length === 0) return;
-
-  const shoryOutputCols = shoryConfig.outputColumns.filter(c => c !== shoryConfig.make && c !== shoryConfig.model);
-  
-  const icCodeHeaders = icConfig.codes.map(codeCol => `Matched IC ${codeCol}`);
-
-  const headers = [
-    `Shory ${shoryConfig.make}`, 
-    `Shory ${shoryConfig.model}`, 
-    ...shoryOutputCols, 
-    'Matched IC Make', 
-    'Matched IC Model', 
-    ...icCodeHeaders,
-    'Match Status', 
-    'Match Confidence (%)', 
-    'Actual Fuzzy Score (%)', 
-    'AI Match Reason',
-    'All Semantic Matches'
-  ];
-  
-  const csvRows = [headers.join(',')];
-
-  data.forEach(row => {
-    const icCodeValues = icConfig.codes.map(codeCol => 
-      `"${((row.matchedICCodes && row.matchedICCodes[codeCol]) || '').replace(/"/g, '""')}"`
-    );
-
-    const semanticMatchesValue = `"${(row.allSemanticMatches || []).join(', ').replace(/"/g, '""')}"`;
-
-    const values = [
-      `"${String(row[shoryConfig.make] ?? '').replace(/"/g, '""')}"`,
-      `"${String(row[shoryConfig.model] ?? '').replace(/"/g, '""')}"`,
-      ...shoryOutputCols.map(col => `"${String(row[col] ?? '').replace(/"/g, '""')}"`),
-      `"${(row.matchedICMake || '').replace(/"/g, '""')}"`,
-      `"${(row.matchedICModel || '').replace(/"/g, '""')}"`,
-      ...icCodeValues,
-      `"${row.matchStatus.replace(/"/g, '""')}"`,
-      `"${(row.matchConfidence !== undefined ? (row.matchConfidence * 100).toFixed(0) + '%' : '').replace(/"/g, '""')}"`,
-      `"${(row.actualFuzzyScore !== undefined ? (row.actualFuzzyScore * 100).toFixed(0) + '%' : '-').replace(/"/g, '""')}"`, 
-      `"${(row.aiReason || '').replace(/"/g, '""')}"`,
-      semanticMatchesValue
-    ];
-    csvRows.push(values.join(','));
-  });
-
-  const blob = new Blob([csvRows.join('\n')], { type: 'text/csv;charset=utf-8;' });
-  const link = document.createElement('a');
-  if (link.download !== undefined) {
-    const url = URL.createObjectURL(blob);
-    link.setAttribute('href', url);
-    link.setAttribute('download', filename);
-    link.style.visibility = 'hidden';
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-  }
-};
