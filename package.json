@@ -9,15 +9,15 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "react": "^19.1.0",
-    "react-dom": "^19.1.0",
     "@google/genai": "^1.6.0",
     "@supabase/supabase-js": "^2.44.4",
-    "lucide-react": "^0.414.0",
-    "framer-motion": "^11.3.19",
     "clsx": "^2.1.1",
-    "tailwind-merge": "^2.4.0",
-    "js-sha256": "^0.11.1"
+    "framer-motion": "^11.3.19",
+    "js-sha256": "^0.11.1",
+    "lucide-react": "^0.414.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "tailwind-merge": "^2.4.0"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",

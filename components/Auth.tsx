@@ -19,6 +19,12 @@ const Auth: React.FC = () => {
     setError(null);
     setMessage(null);
 
+    if (!email.endsWith('@shory.com')) {
+      setError('Access denied. Only @shory.com email addresses are permitted.');
+      setLoading(false);
+      return;
+    }
+
     if (!supabase) {
       setError("Authentication service is not configured.");
       setLoading(false);
