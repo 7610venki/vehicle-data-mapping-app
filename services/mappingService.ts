@@ -12,7 +12,9 @@ import {
   SemanticBatchTask,
   RuleGenerationExample,
   KnowledgeBaseEntry,
+  RuleStatus,
 } from '../types';
+import { v4 as uuidv4 } from 'uuid';
 import { 
   TOP_N_CANDIDATES_FOR_SEMANTIC_LLM,
   SEMANTIC_LLM_BATCH_SIZE,
@@ -539,7 +541,7 @@ export class MappingService {
       llmProvider: LlmProvider,
       sessionService: SessionService,
       layersToLearnFrom: { knowledgeBase: boolean, rules: boolean }
-  ) {
+  ): Promise<LearnedRule[]> { // Changed return type
       const highConfidenceMatches = mappedRecords.filter(record => {
           const isHighConfidence =
               (record.matchStatus === MatchStatus.MATCHED_AI && (record.matchConfidence ?? 0) >= KNOWLEDGE_BASE_CONFIDENCE_THRESHOLD) ||
@@ -548,7 +550,7 @@ export class MappingService {
           return isHighConfidence && record.__shoryMake && record.__shoryBaseModel && record.matchedICMake && record.matchedICModel;
       });
 
-      if (highConfidenceMatches.length === 0) return;
+      if (highConfidenceMatches.length === 0) return [];
 
       // Learn for Knowledge Base
       if (layersToLearnFrom.knowledgeBase) {
@@ -563,7 +565,6 @@ export class MappingService {
               
               const existing = newKnowledge.get(key);
               if (existing) {
-                  // Prevent adding the exact same mapping twice to the array
                   if (!existing.find(e => e.icMake === newEntry.icMake && e.icModel === newEntry.icModel)) {
                       existing.push(newEntry);
                   }
@@ -576,10 +577,10 @@ export class MappingService {
           }
       }
       
+      let pendingRules: LearnedRule[] = [];
       // Learn for Rule Generation
       if (layersToLearnFrom.rules && llmProvider) {
           const ruleExamples: RuleGenerationExample[] = highConfidenceMatches.map(record => ({
-              // Rules should be generated from full normalized text for more context
               shoryMake: record.__shoryMake!,
               shoryModel: record.__shoryModel!,
               icMake: record.matchedICMake!,
@@ -591,8 +592,14 @@ export class MappingService {
 
           if(safeRules.length > 0) {
               console.log(`[Rule Learning] Generated ${proposedRules.length} rules, kept ${safeRules.length} after validation.`);
-              await sessionService.saveLearnedRules(safeRules);
+              // Don't save, instead, add id and status and prepare to return
+              pendingRules = safeRules.map(rule => ({
+                  ...rule,
+                  id: uuidv4(),
+                  status: RuleStatus.PENDING,
+              }));
           }
       }
+      return pendingRules;
   }
 }

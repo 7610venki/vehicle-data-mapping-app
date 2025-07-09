@@ -280,43 +280,83 @@ export class SessionService {
   }
 
   // --- Learned Rules Methods ---
-  
-  // Fetches GLOBAL learned rules.
-  async getLearnedRules(): Promise<LearnedRule[]> {
+
+  async getApprovedLearnedRules(): Promise<LearnedRule[]> {
     if (!supabase) return [];
     try {
-        // Fetch all rules, as this is a shared global resource. No user_id filter.
         const { data, error } = await supabase
             .from('learned_rules')
-            .select('rule_json');
+            .select('id, status, conditions, actions')
+            .eq('status', 'approved');
 
         if (error) throw error;
-        return data.map(row => row.rule_json as LearnedRule);
+        return data.map(row => ({
+            id: row.id,
+            status: row.status,
+            conditions: row.conditions,
+            actions: row.actions,
+        }));
     } catch (err: any) {
-        console.error("Error retrieving learned rules:", err.message ? `${err.message} (Details: ${err.details})` : JSON.stringify(err));
+        console.error("Error retrieving approved learned rules:", err.message ? `${err.message} (Details: ${err.details})` : JSON.stringify(err));
         throw err;
     }
   }
 
-  // Saves rules to the GLOBAL store.
-  async saveLearnedRules(rules: LearnedRule[]): Promise<void> {
+  async getAllLearnedRules(): Promise<LearnedRule[]> {
+    if (!supabase) return [];
+    try {
+        const { data, error } = await supabase
+            .from('learned_rules')
+            .select('id, status, conditions, actions');
+
+        if (error) throw error;
+        return data.map(row => ({
+            id: row.id,
+            status: row.status,
+            conditions: row.conditions,
+            actions: row.actions,
+        }));
+    } catch (err: any) {
+        console.error("Error retrieving all learned rules:", err.message ? `${err.message} (Details: ${err.details})` : JSON.stringify(err));
+        throw err;
+    }
+  }
+
+  async upsertLearnedRules(rules: LearnedRule[]): Promise<void> {
       if (!supabase || rules.length === 0) return;
 
       const rulesToUpsert = rules.map(rule => ({
-          rule_json: rule,
-          rule_hash: sha256(JSON.stringify({c: rule.conditions, a: rule.actions})), // Hash only the logic part to prevent duplicates
+          id: rule.id,
+          status: rule.status,
+          conditions: rule.conditions,
+          actions: rule.actions,
+          rule_hash: sha256(JSON.stringify({c: rule.conditions, a: rule.actions})),
       }));
 
       try {
-          // The onConflict constraint prevents duplicate rules globally.
           const { error } = await supabase
               .from('learned_rules')
-              .upsert(rulesToUpsert, { onConflict: 'rule_hash' });
+              .upsert(rulesToUpsert, { onConflict: 'id' });
 
           if (error) throw error;
       } catch (err: any) {
           console.error("Error saving learned rules:", err.message ? `${err.message} (Details: ${err.details})` : JSON.stringify(err));
-          throw new Error(`Failed to save learned rules: ${err.message}. Ensure the unique constraint 'learned_rules_global_hash_unique' exists.`);
+          throw new Error(`Failed to save learned rules: ${err.message}.`);
       }
+  }
+
+  async deleteLearnedRules(ruleIds: string[]): Promise<void> {
+    if (!supabase || ruleIds.length === 0) return;
+    try {
+      const { error } = await supabase
+        .from('learned_rules')
+        .delete()
+        .in('id', ruleIds);
+      
+      if (error) throw error;
+    } catch (err: any) {
+      console.error("Error deleting learned rules:", err.message ? `${err.message} (Details: ${err.details})` : JSON.stringify(err));
+      throw new Error(`Failed to delete learned rules: ${err.message}.`);
+    }
   }
 }

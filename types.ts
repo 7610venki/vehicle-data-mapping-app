@@ -105,7 +105,15 @@ export interface KnowledgeBaseEntry {
   icModel: string;
 }
 
+export enum RuleStatus {
+  PENDING = 'pending',
+  APPROVED = 'approved',
+  REJECTED = 'rejected',
+}
+
 export interface LearnedRule {
+  id: string; // UUID
+  status: RuleStatus;
   conditions: Array<{ field: 'make' | 'model', operator: 'contains' | 'equals', value: string }>;
   actions: { setMake: string, setModel: string };
 }

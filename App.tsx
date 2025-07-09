@@ -47,6 +47,7 @@ import {
 import { FileUp, FilePlus2, ListChecks, Settings2, Table2 } from 'lucide-react';
 import { findErrorDetails } from './services/apiErrorData';
 import ApiErrorDialog from './components/ApiErrorDialog';
+import RuleReviewDialog from './components/RuleReviewDialog';
 
 // --- State Management using useReducer ---
 type AppState = {
@@ -131,6 +132,11 @@ const AppCore = () => {
   const [useLearnedRulesLayer, setUseLearnedRulesLayer] = useState<boolean>(true);
   const [useFuzzyLayer, setUseFuzzyLayer] = useState<boolean>(true);
   const [useAdvancedAiLayer, setUseAdvancedAiLayer] = useState<boolean>(true);
+
+  const [pendingRules, setPendingRules] = useState<LearnedRule[]>([]);
+  const [isReviewingSessionRules, setIsReviewingSessionRules] = useState<boolean>(false);
+  const [isReviewingAllRules, setIsReviewingAllRules] = useState<boolean>(false);
+  const [allLearnedRules, setAllLearnedRules] = useState<LearnedRule[]>([]);
 
   // --- Performance Optimization for High-Frequency Updates & Background Stability ---
   // These refs hold the "live" data model updated by the background process.
@@ -246,9 +252,11 @@ const AppCore = () => {
         dispatch({ type: 'START_LOADING', payload: { message: "Loading sessions..." } });
         Promise.all([
           sessionServiceInstance.getSessions(session.user.id),
-          fetchKnowledgeBaseCount()
-        ]).then(([savedSessions]) => {
+          fetchKnowledgeBaseCount(),
+          sessionServiceInstance.getAllLearnedRules()
+        ]).then(([savedSessions, _, allRules]) => {
             setSessions(savedSessions);
+            setAllLearnedRules(allRules);
             // Only set the view mode on initial load. Don't flip back to 'welcome'
             // if the user is already deep in the mapping flow.
             if (currentStep <= AppStep.UPLOAD_SHORY) {
@@ -334,7 +342,7 @@ const AppCore = () => {
         try {
           [knowledgeBase, learnedRules] = await Promise.all([
               sessionServiceInstance.getKnowledgeBase(),
-              sessionServiceInstance.getLearnedRules()
+              sessionServiceInstance.getApprovedLearnedRules()
           ]);
         } catch (err: any) {
             dispatch({ type: 'SET_ERROR', payload: `Could not fetch cloud data: ${err.message}`});
@@ -377,11 +385,12 @@ const AppCore = () => {
       
       if (session && sessionServiceInstance && llmProviderInstance) {
           dispatch({ type: 'START_LOADING', payload: { message: "AI is learning from this session..." } });
-          await mappingService.performLearning(
+          const pendingRules = await mappingService.performLearning(
               results, icConfig,
               llmProviderInstance, sessionServiceInstance,
               { knowledgeBase: useKnowledgeBaseLayer, rules: useLearnedRulesLayer }
           );
+          setPendingRules(pendingRules);
           await fetchKnowledgeBaseCount();
       }
 
@@ -584,6 +593,39 @@ const AppCore = () => {
   };
 
   const handleStartNewSession = () => resetApp(true);
+
+  const handleSaveSessionRules = async (approvedRules: LearnedRule[], rejectedRuleIds: string[]) => {
+    if (!sessionServiceInstance) return;
+    dispatch({ type: 'START_LOADING', payload: { message: "Saving rules..." } });
+    try {
+      await sessionServiceInstance.upsertLearnedRules(approvedRules);
+      // We don't need to do anything with rejected rules as they were never saved.
+      setPendingRules([]); // Clear pending rules
+      const allRules = await sessionServiceInstance.getAllLearnedRules();
+      setAllLearnedRules(allRules);
+      await alert({ title: "Success", message: "Rules saved successfully!" });
+    } catch (err: any) {
+      dispatch({ type: 'SET_ERROR', payload: `Failed to save rules: ${err.message}` });
+    } finally {
+      dispatch({ type: 'STOP_LOADING' });
+    }
+  };
+
+  const handleSaveAllRules = async (approvedRules: LearnedRule[], rejectedRuleIds: string[]) => {
+    if (!sessionServiceInstance) return;
+    dispatch({ type: 'START_LOADING', payload: { message: "Saving rules..." } });
+    try {
+      await sessionServiceInstance.upsertLearnedRules(approvedRules);
+      await sessionServiceInstance.deleteLearnedRules(rejectedRuleIds);
+      const allRules = await sessionServiceInstance.getAllLearnedRules();
+      setAllLearnedRules(allRules);
+      await alert({ title: "Success", message: "Rules saved successfully!" });
+    } catch (err: any) {
+      dispatch({ type: 'SET_ERROR', payload: `Failed to save rules: ${err.message}` });
+    } finally {
+      dispatch({ type: 'STOP_LOADING' });
+    }
+  };
   
   const EXPANDABLE_TABS_CONFIG: TabItem[] = STEPS_CONFIG.map(step => ({
         id: step.id.toString(),
@@ -745,6 +787,8 @@ const AppCore = () => {
               <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
                 <div><CardTitle>Mapping Results</CardTitle><CardDescription>Review the {mappedData.length} mapped vehicle records below.</CardDescription></div>
                 <div className="flex-shrink-0 flex items-center gap-2">
+                   <ActionButton variant="secondary" onClick={() => setIsReviewingSessionRules(true)} disabled={pendingRules.length === 0 || isLoading}>Review Session Rules</ActionButton>
+                   <ActionButton variant="secondary" onClick={() => {setIsReviewingAllRules(true);}} disabled={allLearnedRules.length === 0 || isLoading}>Review All Rules</ActionButton>
                    <ActionButton variant="secondary" onClick={handleSaveSession} disabled={mappedData.length === 0 || isLoading || !sessionServiceInstance} icon={<SaveIcon />}>{currentSessionId ? 'Update Session' : 'Save Session'}</ActionButton>
                    <ActionButton variant="primary" onClick={() => downloadCSV(mappedData, shoryConfig, icConfig)} disabled={mappedData.length === 0 || isLoading} icon={<DownloadIcon />}>Download Results</ActionButton>
                 </div>
@@ -816,6 +860,22 @@ const AppCore = () => {
       <footer className="w-full max-w-7xl mt-24 py-10 border-t border-border text-center animate-fadeIn animation-delay-600">
           <p className="text-xs text-muted-foreground/70">&copy; {new Date().getFullYear()} {APP_TITLE}. All rights reserved.</p>
       </footer>
+      <RuleReviewDialog
+        isOpen={isReviewingSessionRules}
+        onClose={() => setIsReviewingSessionRules(false)}
+        rules={pendingRules}
+        onSave={handleSaveSessionRules}
+        title="Review Session Rules"
+        description="Review the rules learned in this session. You can delete any unwanted rules before saving them."
+      />
+      <RuleReviewDialog
+        isOpen={isReviewingAllRules}
+        onClose={() => setIsReviewingAllRules(false)}
+        rules={allLearnedRules}
+        onSave={handleSaveAllRules}
+        title="Review All Rules"
+        description="Review all the learned rules in the system. You can delete any unwanted rules."
+      />
     </div>
   );
 };
