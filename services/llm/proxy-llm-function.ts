@@ -24,7 +24,8 @@ serve(async (req: Request) => {
   try {
     const { provider, model, prompt, tools, responseMimeType } = await req.json();
 
-    if (!provider || !model || !prompt) {
+    // The knowledge base update is a special case that doesn't need a model or prompt.
+    if (provider !== 'knowledge-base-update' && (!provider || !model || !prompt)) {
       return new Response(JSON.stringify({ error: 'Request body must contain "provider", "model", and "prompt".' }), { status: 400, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } });
     }
 
