@@ -107,7 +107,10 @@ export class CustomProvider implements LlmProvider {
   
   async findBestMatchBatch(
     shoryRecords: { id: string; make: string; model: string; }[],
+    icMakeModelList: { make: string; model: string; code?: string }[],
   ): Promise<Map<string, WebSearchBatchResult>> {
+    // Parameter currently unused but required for interface compatibility
+    void icMakeModelList;
     console.warn("findBestMatchBatch (Web Search) is not supported by the CustomProvider and was called.");
     const results = new Map<string, WebSearchBatchResult>();
     shoryRecords.forEach(rec => {
