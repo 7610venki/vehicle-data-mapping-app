@@ -44,6 +44,7 @@ export const TRIM_KEYWORDS = [
   'touring', 'ex', 'lx', 'si', 'dx', 'sx', 'ex-l',
   'base', 'basic', 'value', 'classic', 'custom',
   'sedan', 'coupe', 'hatchback', 'wagon', 'convertible', 'suv', 'truck', 'van', 'minivan',
+  'pick up', 'pickup',
   '4dr', '2dr', '4d', '2d', 'sdn', 'cpe', 'hb', 'conv',
   'v6', 'v8', 'v10', 'v12', 'i4', 'i6', '4-cyl', '6-cyl', '8-cyl', 'l4', 'l6',
   'hybrid', 'phev', 'ev', 'electric', 'ecoboost', 'tdi', 'diesel',
