@@ -40,13 +40,12 @@ This tool is not just an incremental improvement; it's a game-changer for our in
 
 ## 6. Our Intelligent Matching Engine: A Multi-Stage Pipeline
 
-At the core of our tool is a multi-stage processing pipeline that systematically and intelligently matches data. Think of it as an assembly line for data quality, where each stage handles a specific task, ensuriects.
-ng that we get the most accurate results in the most efficient way possible.
+At the core of our tool is a multi-stage processing pipeline that systematically and intelligently matches data. Think of it as an assembly line for data quality, where each stage handles a specific task, ensuring that we get the most accurate results in the most efficient way possible.
 
 ### Stage 1: The Corporate Knowledge Base (Instant, Perfect Matches)
 
 - **What it does:** The moment data is loaded, the engine first consults our **proprietary Corporate Knowledge Base**. This contains all the perfect matches we've made in the past. If a new record is identical to one we've seen before, it's matched instantly.
-- **Strategic Value:** This provides immediate value, leveraging our historical work to handle a significant portion of the data with 100% confidence and zero processing cost. It ensures consistency across all our proj
+- **Strategic Value:** This provides immediate value, leveraging our historical work to handle a significant portion of the data with 100% confidence and zero processing cost. It ensures consistency across all our projects.
 ### Stage 2: The Rule Engine (Automated Best Practices)
 
 - **What it does:** The next stage applies a set of **AI-generated "Learned Rules."** These are simple, high-confidence rules the system has created based on previous high-quality matches (e.g., "If the input contains 'Tycn', it should be mapped to 'Tycan'").
