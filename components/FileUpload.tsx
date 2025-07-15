@@ -62,10 +62,21 @@ const FileUpload: React.FC<FileUploadProps> = ({
     if (disabled) return;
 
     const file = event.dataTransfer.files?.[0];
-    if (file && (acceptedFileTypes.split(',').some(type => file.type.includes(type.trim().replace('.', ''))) || acceptedFileTypes.split(',').some(type => file.name.endsWith(type.trim())) ) ) {
+    const accepted = acceptedFileTypes
+      .split(',')
+      .map(t => t.trim().toLowerCase());
+    const fileExt = file ? file.name.toLowerCase() : '';
+    const isValid =
+      file &&
+      (
+        accepted.some(type => file.type.toLowerCase().includes(type.replace('.', '')))
+        || accepted.some(type => fileExt.endsWith(type))
+      );
+
+    if (file && isValid) {
       setFileName(file.name);
       onFileUpload(file);
-      if(inputRef.current) inputRef.current.files = event.dataTransfer.files;
+      if (inputRef.current) inputRef.current.files = event.dataTransfer.files;
     } else if (file) {
         await alert({
             title: 'Invalid File Type',
