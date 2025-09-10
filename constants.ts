@@ -5,7 +5,7 @@
 // Do not store API keys in client-side code.
 export const GITHUB_REPO_URL = 'https://github.com/7610venki/vehicle-data-mapping-app'; // <-- UPDATE THIS
 
-export const GEMINI_MODEL_TEXT = 'gemini-2.5-flash-preview-04-17';
+export const GEMINI_MODEL_TEXT = 'gemini-2.5-flash';
 export const CUSTOM_LLM_DEFAULT_ENDPOINT = 'https://api.groq.com/openai/v1/chat/completions';
 export const CUSTOM_LLM_DEFAULT_MODEL = 'llama3-8b-8192';
 
